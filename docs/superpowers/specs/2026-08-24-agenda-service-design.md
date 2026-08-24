@@ -62,7 +62,7 @@ Este documento cobre **apenas** o `agenda-service`. As decisões sobre `optin-se
 
 Um middleware, no início de cada requisição:
 1. Lê a claim `tenant_schema` do JWT validado.
-2. Executa `SET search_path TO <tenant_schema>, public` na conexão.
+2. Executa `SET search_path TO <tenant_schema>, cerc, public` na conexão — `cerc` sempre presente, pois é infraestrutura compartilhada e não varia por tenant.
 3. Se o tenant for do tipo compartilhado (schema `agenda` pool), também executa `SET app.cnpj_financiador = '<cnpj>'` para as políticas de RLS.
 4. Ao final da requisição, o `search_path` é resetado (uma conexão nunca deve "herdar" o schema de uma requisição anterior).
 
