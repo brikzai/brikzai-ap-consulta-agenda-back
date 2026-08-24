@@ -35,6 +35,7 @@
 - Create: `requirements.txt`
 - Create: `.env.example`
 - Create: `Dockerfile`
+- Create: `.dockerignore`
 - Create: `pytest.ini`
 - Test: `apps/agenda/tests/test_health.py`
 - (`.gitignore` already exists — no change needed here.)
@@ -47,13 +48,14 @@
 ```
 django>=4.2,<5.0
 djangorestframework>=3.15
+django-cors-headers
 python-dotenv
 sqlalchemy>=2.0
 pg8000
 cloud-sql-python-connector[pg8000]
 google-cloud-secret-manager
 httpx
-pyjwt[crypto]
+pyjwt[crypto]>=2.8
 python-ulid
 pytest
 pytest-django
@@ -67,6 +69,11 @@ gunicorn
 ENVIRONMENT=development
 DJANGO_SECRET_KEY=dev-secret-key-change-in-production
 ALLOWED_HOSTS=*
+
+# Front separado consome esta API (design doc §3.6/§10) — vazio por padrão
+# (nenhuma origem liberada) até ser configurado; em dev local aponta pro
+# Vite, mesmo padrão do ap-back-contratos.
+CORS_ALLOWED_ORIGINS=http://localhost:5173
 
 # Usados só por scripts/apply_schema.py (Plan 02) — um alvo fixo por vez,
 # não passa pela abstração de tenant do app em runtime (mesmo padrão do
@@ -105,16 +112,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key-change-in-production")
 DEBUG = os.getenv("ENVIRONMENT", "development").lower() != "production"
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
+ALLOWED_HOSTS = [h.strip() for h in os.getenv("ALLOWED_HOSTS", "*").split(",") if h.strip()]
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "rest_framework",
+    "corsheaders",
     "apps.agenda",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
 
@@ -123,6 +132,11 @@ WSGI_APPLICATION = "config.wsgi.application"
 
 # Sem Django ORM — dados via shared.cloudsql_client (design doc §3, Plan 03).
 DATABASES = {}
+
+# Front separado consome esta API (design doc §3.6/§10).
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()
+]
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [],
@@ -215,11 +229,12 @@ python_files = tests.py test_*.py *_tests.py
 
 ```python
 # apps/agenda/tests/test_health.py
-import pytest
+# Sem @pytest.mark.django_db / import pytest: este projeto nao usa Django
+# ORM (DATABASES = {}, design doc §3), e o marker django_db tenta acessar
+# connections['default'], que quebra com DATABASES vazio.
 from django.test import Client
 
 
-@pytest.mark.django_db
 def test_health_returns_ok():
     response = Client().get("/api/v1/health")
     assert response.status_code == 200
@@ -233,11 +248,29 @@ Create empty `apps/agenda/tests/__init__.py` alongside it.
 Run: `pip install -r requirements.txt` then `pytest apps/agenda/tests/test_health.py -v`
 Expected: PASS (this is a scaffold smoke test — there is no prior "red" state to observe since `health` has no logic to break; verifying it passes on first run confirms the scaffold is wired correctly).
 
-- [ ] **Step 13: Write `Dockerfile`**
+- [ ] **Step 13: Write `Dockerfile` and `.dockerignore`**
+
+`.dockerignore` (copiado de `ap-back-contratos` — sem isso, `COPY . .` empacota `.env` com credenciais reais do Cloud SQL na imagem):
+
+```
+.git/
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+docs/
+.superpowers/
+logs/
+*.pem
+```
+
+`Dockerfile`:
 
 ```dockerfile
 FROM python:3.12-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
@@ -248,7 +281,7 @@ CMD exec gunicorn config.wsgi:application --bind :$PORT --workers 4
 - [ ] **Step 14: Commit**
 
 ```bash
-git add manage.py config apps requirements.txt .env.example Dockerfile pytest.ini
+git add manage.py config apps requirements.txt .env.example Dockerfile .dockerignore pytest.ini
 git commit -m "feat: scaffold Django project (no ORM), health endpoint"
 ```
 
