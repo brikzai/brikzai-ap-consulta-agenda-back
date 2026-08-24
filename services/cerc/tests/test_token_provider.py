@@ -99,6 +99,67 @@ def test_invalidate_token_forces_refetch():
 
 
 @respx.mock
+def test_fetch_token_sanitiza_erro_em_resposta_nao_2xx():
+    respx.post("https://api.int.cerc.com/oauth/token").mock(
+        return_value=httpx.Response(500, json={"error": "internal"})
+    )
+
+    with pytest.raises(token_provider.CercTokenError) as exc_info:
+        token_provider.get_cerc_token(FINANCIADOR_TESTE)
+
+    exc = exc_info.value
+    assert "segredo-local" not in str(exc)
+    assert "segredo-local" not in repr(exc)
+    assert FINANCIADOR_TESTE in str(exc)
+
+    # a exceção original não deve ficar encadeada (ela carregaria o frame
+    # com client_id/client_secret em seu traceback)
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+
+
+@respx.mock
+def test_fetch_token_sanitiza_erro_de_conexao():
+    respx.post("https://api.int.cerc.com/oauth/token").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+
+    with pytest.raises(token_provider.CercTokenError) as exc_info:
+        token_provider.get_cerc_token(FINANCIADOR_TESTE)
+
+    exc = exc_info.value
+    assert "segredo-local" not in str(exc)
+    assert "segredo-local" not in repr(exc)
+    assert FINANCIADOR_TESTE in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+
+
+@respx.mock
+def test_fetch_token_nao_mantem_client_secret_no_frame_apos_erro():
+    respx.post("https://api.int.cerc.com/oauth/token").mock(
+        return_value=httpx.Response(500)
+    )
+
+    try:
+        token_provider._fetch_token(FINANCIADOR_TESTE)
+    except token_provider.CercTokenError as exc:
+        tb = exc.__traceback__
+        found_fetch_frame = False
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code.co_name == "_fetch_token":
+                found_fetch_frame = True
+                assert "client_secret" not in frame.f_locals
+                assert "client_id" not in frame.f_locals
+                assert "config" not in frame.f_locals
+            tb = tb.tb_next
+        assert found_fetch_frame
+    else:
+        pytest.fail("CercTokenError não foi levantada")
+
+
+@respx.mock
 def test_get_cerc_token_isola_cache_entre_tenants(monkeypatch):
     monkeypatch.setenv("TENANT_99999999000191_CONFIG", json.dumps({
         "cerc_client_id": "client-999",
