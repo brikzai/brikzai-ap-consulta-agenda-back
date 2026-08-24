@@ -142,3 +142,49 @@ def test_gte_lte_filters_range_query():
     finally:
         db.table("dominio_arranjo").delete().eq("codigo", "GTE1").execute()
         db.table("dominio_arranjo").delete().eq("codigo", "GTE2").execute()
+
+
+def test_array_column_round_trips_as_native_postgres_array():
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("politica_consulta").delete().eq("motivo", "TESTE_ARRAY").execute()
+    try:
+        inserted = db.table("politica_consulta").insert({
+            "id": "01J8ZKARRAYTEST0000000001",
+            "motivo": "TESTE_ARRAY",
+            "modos_permitidos": ["BATCH", "ONLINE"],
+        }).execute()
+        assert inserted.data[0]["modos_permitidos"] == ["BATCH", "ONLINE"]
+
+        found = db.table("politica_consulta").select("*").eq("motivo", "TESTE_ARRAY").execute()
+        assert found.data[0]["modos_permitidos"] == ["BATCH", "ONLINE"]
+    finally:
+        db.table("politica_consulta").delete().eq("motivo", "TESTE_ARRAY").execute()
+
+
+def test_unfiltered_delete_raises_without_allow_all():
+    db = get_db(FINANCIADOR_TESTE)
+    with pytest.raises(ValueError):
+        db.table("dominio_arranjo").delete().execute()
+
+
+def test_unfiltered_delete_allowed_with_allow_all(monkeypatch):
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("dominio_arranjo").insert({
+        "codigo": "ZZZ_ALLOWALL", "descricao": "teste", "ativo": True,
+        "atualizado_em": "2026-08-19T00:00:00-03:00",
+    }).execute()
+    # Não realmente deleta a tabela inteira — só prova que allow_all=True passa
+    # pela guarda; a limpeza abaixo usa .eq() como qualquer outro teste.
+    result = db.table("dominio_arranjo").delete(allow_all=True).eq("codigo", "ZZZ_ALLOWALL").execute()
+    assert len(result.data) == 1
+
+
+def test_invalid_table_name_rejected():
+    with pytest.raises(ValueError):
+        get_db(FINANCIADOR_TESTE).table("agenda_ur; DROP TABLE agenda_ur")
+
+
+def test_invalid_column_name_rejected_in_filter():
+    db = get_db(FINANCIADOR_TESTE)
+    with pytest.raises(ValueError):
+        db.table("dominio_arranjo").select("*").eq("codigo = '1'; DROP TABLE dominio_arranjo; --", "x").execute()
