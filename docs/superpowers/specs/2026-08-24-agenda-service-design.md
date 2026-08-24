@@ -193,6 +193,8 @@ Function-based views (`apps/agenda/views.py`), sem DRF ViewSets. Todas exigem `@
 | `GET /api/v1/compliance/relatorio` | Relatório de consultas por período/UFR/ator (síncrono/paginado inicialmente) |
 | `POST /api/v1/webhooks/agenda` | Receptor do webhook CERC (§8) |
 
+**Atenção de segurança para `GET /api/v1/agendas/urs` (achado na revisão do Plano 03):** `QueryBuilder` (`shared/cloudsql_client.py`) monta nome de tabela/coluna por interpolação de string, não por bind parameter — só os *valores* passam por bind. Isso é seguro hoje porque todo chamador usa literais fixos, mas essa view é a primeira a mapear um parâmetro de query string do usuário (`?ufr=...&dataLiquidacaoInicio=...`) para um nome de coluna (`.eq(field, ...)`/`.order(field, ...)`). **Nunca repassar o nome do parâmetro direto** — validar contra uma lista fixa de colunas permitidas antes de chamar `.eq()`/`.order()`. Registrar isso no plano/brief que implementar este endpoint.
+
 ## 11. Compliance e auditoria
 
 - `ator` (de `request.jwt_claims`) e `origem_ip` preenchidos no momento da consulta, gravados em `consulta_agenda` — retenção de 5 anos, sem expurgo.
