@@ -2,20 +2,34 @@
 
 > **Status:** aguardando revisão do usuário
 > **Repositório:** `ap-back-consulta-agenda`
-> **Specs de origem:** `docs/specs/SPEC-03-consulta-de-agenda-ap005.md` (funcional/CERC), `docs/specs/SPEC-04-modelo-de-dados.md` (DDL, autoritativa — substitui o §9 da SPEC 03)
-> **Data:** 2026-08-24
+> **Specs de origem:** `docs/specs/SPEC-03-consulta-de-agenda-ap005.md` (funcional/CERC). `docs/specs/SPEC-04-modelo-de-dados.md` fica só como referência de nomes de campo/regras de negócio — o DDL dela (schemas, domínios, particionamento) **não** é a convenção real da casa (ver §5).
+> **Data:** 2026-08-24 (revisão 2 — realinhado à convenção já implementada em `ap-back-optin`/`ap-back-contratos`, ver §0)
+
+## 0. Por que este documento foi revisado
+
+A revisão 1 deste design assumia Django ORM, migrations, Celery e multi-tenancy híbrida (schema dedicado × schema+RLS) — nenhuma dessas decisões existia de fato na plataforma. Ao investigar os dois serviços irmãos já em construção (`C:\DEV\ap\ap-back-optin`, `C:\DEV\ap\ap-back-contratos`), a convenção real é:
+
+- **Sem Django ORM.** `DATABASES = {}`; acesso via `shared/cloudsql_client.py` próprio.
+- **Sem migration framework.** SQL versionado em `sql/schema/NN-*.sql`, aplicado por um script (`scripts/apply_schema.py`).
+- **Multi-tenancy = um banco Cloud SQL inteiro por financiador**, não schema compartilhado nem RLS.
+- **JWT validado localmente** (RS256, chave pública fixa) contra um **IdP corporativo** — nenhum serviço emite JWT para os outros.
+- **Cada serviço autentica na CERC com credenciais próprias por tenant** — sem chamada entre serviços para obter token.
+- **Sem Celery.** Deploy em **Cloud Run**; assíncrono via **Pub/Sub** (webhook) e **Cloud Scheduler** (jobs periódicos).
+- **Function-based views**, sem DRF ViewSets.
+
+Este documento adota essa convenção integralmente. A lógica de negócio (regras de agenda, correlação de webhook, parser de arquivo, catálogo de erros) não muda — só a forma de persistir e servir isso.
 
 ## 1. Contexto e objetivo
 
-Este serviço (`agenda-service`) implementa a **consulta de agenda de recebíveis** (CERC-AP005), um dos três serviços do produto:
+Este serviço (`agenda-service`) implementa a **consulta de agenda de recebíveis** (CERC-AP005), um dos três serviços do produto — irmão de `ap-back-optin` e `ap-back-contratos`, mesma squad, mesmo papel na cadeia CERC (Financiador):
 
-| Serviço | Responsabilidade | Schema Postgres (SPEC 04) |
+| Serviço | Responsabilidade | Banco (Cloud SQL) |
 |---|---|---|
-| `optin-service` | Opt-in/opt-out, auth centralizada (JWT), registro de financiadores e roteamento de tenant | `optin` (+ dono do `cerc` compartilhado) |
-| `agenda-service` (este) | Consulta de agenda batch/online, webhook de agenda, ingestão AP005/AP005A/AP005B | `agenda` |
-| `contrato-service` | Registro de contratos e garantias (SPEC 02) | `contrato` |
+| `optin-service` | Opt-in/opt-out | um banco **por financiador**, instância `app-db` (dev) |
+| `agenda-service` (este) | Consulta de agenda batch/online, webhook de agenda, ingestão AP005/AP005A/AP005B | um banco **por financiador**, instância `app-db` (dev, banco `agenda`) |
+| `contrato-service` | Registro de contratos e garantias (SPEC 02) | um banco **por financiador**, instância `contratos-db` (ainda pré-multi-tenant) |
 
-Este documento cobre **apenas** o `agenda-service`. As decisões sobre `optin-service` e `contrato-service` aparecem aqui só como **interfaces assumidas** (§14).
+Não há schema/cluster compartilhado entre serviços — cada um tem sua própria cópia local das tabelas de infraestrutura que precisa (`cerc_requisicao`, `webhook_inbox`, `dominio_arranjo`), como já é o caso em `optin`/`contrato`. Este documento cobre **apenas** o `agenda-service`. Dependências de outros serviços aparecem como **interfaces assumidas** (§14).
 
 ## 2. Escopo
 
@@ -27,110 +41,147 @@ Este documento cobre **apenas** o `agenda-service`. As decisões sobre `optin-se
 - Configuração self-service de política de modo (BATCH/ONLINE) por finalidade
 - Compliance (trilha de auditoria, rate limit, relatório) e observabilidade do domínio de agenda
 
-**Fora do escopo (dependências externas, ver §14):** emissão de JWT, registro de financiadores/tenant, opt-in/opt-out, registro de contratos.
+**Fora do escopo (dependências externas, ver §14):** emissão de JWT (IdP corporativo), opt-in/opt-out, registro de contratos.
+
+**Fora da fase 1 (YAGNI, mesmo espírito do `contrato-service` §3/§8):** particionamento de tabela, domínios Postgres customizados, Row-Level Security. Nenhum dos três serviços irmãos precisou disso até agora — se o volume real de `agenda_ur` justificar depois, é uma migração deliberada, não uma antecipação especulativa.
 
 ## 3. Decisões transversais já fechadas
 
-1. **Stack:** Python + Django.
-2. **Autenticação entre serviços:** `optin-service` centraliza as credenciais OAuth2 da CERC (`TokenProvider`) e emite um JWT interno; os demais serviços **validam localmente** (JWKS), sem round-trip síncrono por requisição, exceto para obter token CERC (§8 abaixo).
-3. **Multi-tenancy híbrida:** financiadores grandes/regulados recebem **schema Postgres dedicado**; financiadores menores compartilham o schema `agenda` com coluna `cnpj_financiador` + **Row-Level Security**. A decisão de qual tenant usa qual modalidade, e o registro de financiadores, é responsabilidade do `optin-service` — o `agenda-service` só **consome** essa decisão via claim do JWT (`tenant_schema`) e session var Postgres (`app.cnpj_financiador`) quando aplicável.
-4. **Modelo de dados:** SPEC 04 é autoritativa. O DDL do schema `agenda` roda via migrations `RunSQL` versionadas; os modelos Django mapeiam essas tabelas com `managed=False`.
+1. **Stack:** Python + Django, **sem ORM** (`DATABASES = {}`). Acesso a dados via `shared/cloudsql_client.py` — API estilo Supabase/PostgREST sobre SQLAlchemy + Cloud SQL Python Connector, **copiado** de `ap-back-optin` (não vira dependência de package compartilhado entre repos, mesma decisão já tomada para os outros dois serviços).
+2. **Multi-tenancy:** um banco Cloud SQL **inteiro por financiador** (`financiador_id` = CNPJ, 14 dígitos). Config por tenant em `TENANT_{financiador_id}_CONFIG` (Secret Manager em produção, env var em dev), lida por `shared/tenant_config.py` (copiado de `ap-back-optin`, sem alterar).
+3. **Autenticação:** JWT do IdP corporativo, validado localmente (RS256, chave pública fixa, sem JWKS) por `shared/jwt_auth.py` (copiado de `ap-back-optin`). Exige o claim `financiador_id` (CNPJ, 14 dígitos) — resolve o tenant e preenche `request.financiador_id` em toda view decorada com `@jwt_required`.
+4. **CERC:** `agenda-service` autentica com **credenciais OAuth2 próprias**, por tenant (`services/cerc/token_provider.py`, copiado de `ap-back-optin`, chaveado por `financiador_id`). Nenhuma chamada a outro serviço para obter token — mesma decisão explícita já registrada no design do `contrato-service`.
+5. **Deploy e assíncrono:** Cloud Run, sem Celery. Webhook → grava em `webhook_inbox` local, publica em tópico Pub/Sub, endpoint de push processa. Jobs periódicos (varredura de completude de consulta, polling de arquivo AP005, sincronização de `dominio_arranjo`) via **Cloud Scheduler** batendo em endpoints HTTP internos protegidos por OIDC.
+6. **Views:** function-based, sem DRF ViewSets — API JSON pura consumida por um front separado (mesma decisão do `contrato-service`).
+7. **Schema do banco:** SQL puro versionado em `sql/schema/NN-*.sql`, aplicado por `scripts/apply_schema.py`. Sem particionamento/domínios customizados na fase 1 (§2).
 
-## 4. Arquitetura de componentes (apps Django)
+## 4. Estrutura de pastas
 
-| App | Responsabilidade |
-|---|---|
-| `consultas` | Orquestra consulta batch/online; roda validações locais `A01`–`A10`; grava `consulta_agenda` |
-| `webhooks` | Recebe `tipoEvento=agenda`; grava em `cerc.webhook_inbox` (idempotente); dispara processamento assíncrono |
-| `correlacao` | Casa UR de webhook com consultas em janela; grava `consulta_agenda_ur` / `agenda_ur_orfa` |
-| `ingestao_arquivo` | Pipeline AP005/AP005A/AP005B — streaming, gzip, idempotência |
-| `agenda_ur` | Modelo de domínio + repositório de upsert (regra de frescor/precedência) |
-| `politica_consulta` | Configuração self-service de modo permitido por finalidade |
-| `api_interna` | Endpoints `/api/v1/agendas/*` e `/api/v1/config/*` |
-| `compliance` | Rate limit por UFR, trilha de auditoria, relatório exportável |
-| `observabilidade` | Métricas Prometheus, logging estruturado |
+```
+consulta-agenda/
+├── manage.py
+├── requirements.txt
+├── Dockerfile
+├── sql/schema/                        # 01-agenda-schema.sql = fase 1
+├── scripts/apply_schema.py            # aplica um .sql no Cloud SQL real
+├── config/                            # settings.py (DATABASES={}), urls.py, wsgi.py
+├── apps/
+│   └── agenda/
+│       ├── views.py                   # API interna (§10) + webhook receptor CERC + push Pub/Sub
+│       ├── urls.py
+│       ├── validation.py              # A01-A10 (SPEC03 §10.1 + política de consulta)
+│       ├── repository.py              # upsert de agenda_ur/agenda_ur_pagamento (regra de frescor)
+│       ├── parser_ap005.py            # parser AP005/AP005A/AP005B
+│       ├── correlacao.py              # casamento webhook <-> consulta (SPEC03 §5.4)
+│       └── management/commands/       # varrer_completude, sincronizar_dominio_arranjo, importar_ap005
+├── services/
+│   └── cerc/
+│       ├── token_provider.py          # copiado de ap-back-optin — OAuth2 client-credentials por tenant
+│       └── client.py                  # consultar_agenda (online/batch)
+└── shared/
+    ├── cloudsql_client.py             # copiado de ap-back-optin
+    ├── jwt_auth.py                    # copiado de ap-back-optin
+    ├── tenant_config.py               # copiado de ap-back-optin
+    ├── secrets.py                     # copiado de ap-back-optin
+    └── pubsub_client.py                # publish helper (webhook inbox), mesmo molde do contrato-service
+```
 
-## 5. Camada de dados
+Decisões YAGNI explícitas (mesmo espírito dos dois irmãos):
 
-- DDL do schema `agenda` (SPEC 04 §5.4) aplicado via migrations `RunSQL`, versionado no repositório. Django não gerencia particionamento, `PARTITION BY`, `ON CONFLICT ... WHERE` ou funções — isso está fora do que o schema editor do Django expressa.
-- Modelos Django para leitura/query padrão: `managed=False`, mapeando 1:1 as tabelas de `agenda.*`.
-- Escritas críticas (upsert de `agenda_ur`/`agenda_ur_pagamento`, carga em massa de arquivo) passam por um **repositório com SQL explícito** — não por `.save()` — porque a precedência de frescor (`WEBHOOK > SINCRONO > ARQUIVO`, SPEC 04 §5.5) não é expressável via ORM padrão.
-- Views de fronteira consumidas (somente leitura): `optin.v_base_autorizativa`. View de fronteira exposta (somente leitura para `contrato-service`): `agenda.v_posicao_ufr`.
-- `identificador_cerc_contrato` referencia `contrato.contrato.id_contrato_cerc` **por valor**, sem FK (dados chegam por canais independentes, fora de ordem).
+- Sem interface/porta formal `CercAgendaGateway` — só existe o adapter REST hoje.
+- Sem camada de domínio separada — regras locais cabem em `apps/agenda/validation.py`.
+- Sem pasta `jobs/` própria — jobs são management commands, disparados por Cloud Scheduler.
+- Sem parser AP005A/AP005B (arquivos segregados) nesta fase — entra quando o serviço de segregação for habilitado no portal do cliente (SPEC03 §6.5); o parser de AP005 já nasce tolerante ao layout dos três (mesma coluna-count detection), só o job de polling AP005A/AP005B fica pra depois.
+
+## 5. Camada de dados — fase 1
+
+Tabelas usadas por esta fase, nomes e campos vindos da SPEC03 (§4.3, §9) e da SPEC04 (só como referência de nomenclatura — não do DDL dela): `consulta_agenda`, `agenda_ur`, `agenda_ur_pagamento`, `consulta_agenda_ur`, `agenda_ur_orfa`, `agenda_ur_rejeitada`, `arquivo_agenda_processado`, `politica_consulta`, `cerc_requisicao`, `webhook_inbox`, `dominio_arranjo`.
+
+**Fora da fase 1:** `indicador_consistencia_agenda` (entra junto com `tipoAvaliacao`, não usado ainda pela API interna fase 1).
+
+Tipos monetários: `NUMERIC(18,2)` no Postgres, `decimal.Decimal` em Python. **Proibido `float`/`double`** (mesmo requisito do `contrato-service`, verificado por teste).
+
+IDs técnicos: `TEXT`, gerados como ULID na aplicação (`python-ulid`) — mesma convenção dos dois serviços irmãos.
+
+`agenda_ur`/`agenda_ur_pagamento` usam a **chave natural da UR** como chave primária composta (sem `id` técnico) — mesma razão da SPEC04 §11.1 (a chave natural já é a identidade real do dado, e evita uma coluna extra em uma tabela que pode crescer muito), só que sem particionamento (§2) — se o volume justificar depois, particionar é uma migração isolada, não uma decisão da fase 1.
 
 ## 6. Roteamento de tenant
 
-Um middleware, no início de cada requisição:
-1. Lê a claim `tenant_schema` do JWT validado.
-2. Executa `SET search_path TO <tenant_schema>, cerc, public` na conexão — `cerc` sempre presente, pois é infraestrutura compartilhada e não varia por tenant.
-3. Se o tenant for do tipo compartilhado (schema `agenda` pool), também executa `SET app.cnpj_financiador = '<cnpj>'` para as políticas de RLS.
-4. Ao final da requisição, o `search_path` é resetado (uma conexão nunca deve "herdar" o schema de uma requisição anterior).
+`@jwt_required` (de `shared/jwt_auth.py`) resolve `request.financiador_id` a partir do JWT. Toda view que acessa dados chama `get_db(request.financiador_id)` (de `shared/cloudsql_client.py`) e, quando precisa falar com a CERC, `get_cerc_token(request.financiador_id)` (de `services/cerc/token_provider.py`). Não há middleware de schema/RLS — o isolamento é físico (um banco por tenant), então uma query mal escrita não pode vazar dado de outro financiador por definição (não existe "outro financiador" visível na mesma conexão).
 
-Consequência de design: como o isolamento de tenant acontece na fronteira (schema dedicado ou RLS), as leituras de `GET /urs` e `GET /urs/posicao` **não** precisam reconferir autorização a cada linha — o dado já só existe naquele tenant porque passou pela checagem de base autorizativa (`A07`) no momento da escrita (consulta ou arquivo).
+Jobs disparados por Cloud Scheduler (varredura de completude, polling de arquivo) rodam **por tenant**: o endpoint interno itera a lista de tenants configurados (§14, ponto em aberto — como essa lista é obtida) e chama `get_db(financiador_id)` para cada um.
 
 ## 7. Política de consulta (self-service, fail-closed)
 
-Nova tabela `agenda.politica_consulta`:
+Tabela `politica_consulta`:
 
 ```sql
-CREATE TABLE agenda.politica_consulta (
-  id                 cerc.ulid PRIMARY KEY,
-  cnpj_financiador   cerc.documento NOT NULL,  -- constante/implícito em schema dedicado
+CREATE TABLE politica_consulta (
+  id                 TEXT PRIMARY KEY,
   motivo             TEXT NOT NULL,
-  modos_permitidos   TEXT[] NOT NULL CHECK (modos_permitidos <@ ARRAY['BATCH','ONLINE']),
+  modos_permitidos   TEXT[] NOT NULL,
   ativo              BOOLEAN NOT NULL DEFAULT true,
   criado_em          TIMESTAMPTZ NOT NULL DEFAULT now(),
   atualizado_em      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  versao             INT NOT NULL DEFAULT 1,
-  CONSTRAINT politica_unica UNIQUE (cnpj_financiador, motivo)
+  UNIQUE (motivo)
 );
 ```
 
+Sem coluna `cnpj_financiador` — o isolamento já é o banco inteiro (§6), então "a política daquele financiador" é só "a linha nesse banco". Validação de `modos_permitidos <@ ARRAY['BATCH','ONLINE']` vira checagem em `apps/agenda/validation.py` (não `CHECK` de banco — mesmo estilo dos irmãos, que preferem `TEXT` simples + validação de aplicação a `CHECK` elaborado, já que o domínio muda por decisão de produto, não por regra imutável do banco).
+
 Regras:
-- **Fail-closed:** sem política ativa para `(financiador, motivo)` → `403 POLITICA_NAO_CONFIGURADA`, sem chamar a CERC. Nova regra local `A10`, ao lado de `A01`–`A09` (SPEC 03 §10.1).
-- O campo `modo` continua vindo do chamador (compatibilidade com SPEC 03 §7.1), mas é **validado** contra `modos_permitidos` da política daquele `motivo` — o chamador não escolhe livremente, escolhe dentro do que a política autoriza.
-- Self-service: cada financiador só vê/edita a própria política, escopado pelo JWT.
+- **Fail-closed:** sem política ativa para `motivo` → `403 POLITICA_NAO_CONFIGURADA`, sem chamar a CERC. Nova regra local `A10`, ao lado de `A01`–`A09` (SPEC03 §10.1).
+- O campo `modo` continua vindo do chamador (compatibilidade com SPEC03 §7.1), mas é **validado** contra `modos_permitidos` da política daquele `motivo`.
+- Self-service: cada financiador só vê/edita a própria política — automático, dado que cada um tem seu próprio banco.
 - Endpoints: `GET/PUT/DELETE /api/v1/config/politicas-consulta`.
 
 ## 8. Integração com a CERC
 
-**Infra assíncrona:** Celery + Redis para todo processamento fora do caminho síncrono da requisição (worker de webhook, varredura de completude, reprocessamento com backoff).
-
-**Cliente de consulta (`POST /v15/agenda/consultar`):**
-1. Roda `A01`–`A10` localmente antes de qualquer chamada externa.
-2. Obtém token CERC do financiador chamando um endpoint interno do `optin-service` (interface assumida, §14) — `agenda-service` não guarda credencial CERC própria.
-3. Registra toda chamada (request/response/tentativa/duração) em `cerc.cerc_requisicao`.
-4. **Batch** (`online=false`/omitido): chama, persiste com `origem='SINCRONO'` (upsert §5.5 SPEC 04), devolve `200` consolidado.
+**Cliente de consulta (`POST /v15/agenda/consultar`, `services/cerc/client.py`):**
+1. Roda `A01`–`A10` localmente antes de qualquer chamada externa (`apps/agenda/validation.py`).
+2. `get_cerc_token(financiador_id)` — token cacheado em memória por processo, renovação a 80% de `expires_in`, single-flight via lock (mesmo padrão de `services/cerc/token_provider.py` do optin). Em `401`, invalida e repete uma única vez.
+3. Toda chamada grava uma linha em `cerc_requisicao` **antes** de interpretar a resposta (mesmo padrão dos irmãos).
+4. **Batch** (`online=false`/omitido): chama, persiste com `origem='SINCRONO'` (upsert §9 abaixo), devolve `200` consolidado.
 5. **Online** (`online=true`): chama, persiste o retorno síncrono (`origem='SINCRONO'`), cria `consulta_agenda` em `PARCIAL`, devolve `202` com `consultaId` imediatamente — nunca espera o webhook.
-6. Mapeamento de erros CERC (SPEC 03 §10): `105001` → sucesso vazio (`200`, lista vazia); `105003`/`105999`/`105998` → retentável com backoff; `105802` → não deveria ocorrer (bloqueado antes por `A07`), e se ocorrer é alerta crítico; demais códigos de validação → `422` local.
+6. Mapeamento de erros CERC (SPEC03 §10): `105001` → sucesso vazio (`200`, lista vazia); `105003`/`105999`/`105998` → retentável com backoff; `105802` → não deveria ocorrer (bloqueado antes por `A07`), e se ocorrer é alerta crítico; demais códigos de validação → `422` local.
 
-**Receptor de webhook (`tipoEvento=agenda`):**
-- Handler HTTP grava o payload bruto em `cerc.webhook_inbox` (com `hash_dedupe`) e retorna `2xx` em <200ms. Nenhuma lógica de negócio no caminho síncrono.
-- Worker Celery consome a fila (índice parcial `WHERE processado_em IS NULL`) e, por UR:
-  - Correlação (SPEC 03 §5.4): casa `(instituicaoCredenciadora, codigoArranjoPagamento, documentoUsuarioFinalRecebedor, documentoTitular, dataLiquidacao)` contra `consulta_agenda` em `PARCIAL`/`ONLINE`, tratando `99T` como universo e a janela de datas como intervalo.
+**Receptor de webhook (`tipoEvento=agenda`, `POST /api/v1/webhooks/agenda`):**
+- Handler grava o payload bruto em `webhook_inbox` (com `hash_dedupe`) e responde `2xx` em <200ms — nenhuma lógica de negócio na rota. Registrado diretamente na CERC, não passa por outro serviço.
+- Publica em um tópico Pub/Sub (`agenda-webhook-inbox`); se o publish falhar, um job de varredura (Cloud Scheduler) recupera por `processado_em IS NULL` — mesmo padrão do `contrato-service`.
+- Push subscription bate num endpoint próprio (verificado por OIDC) que roda a **correlação** (SPEC03 §5.4, `apps/agenda/correlacao.py`): casa `(instituicaoCredenciadora, codigoArranjoPagamento, documentoUsuarioFinalRecebedor, documentoTitular, dataLiquidacao)` contra `consulta_agenda` em `PARCIAL`/`ONLINE`, tratando `99T` como universo e a janela de datas como intervalo.
   - 0 casamentos → `agenda_ur_orfa` (nunca descarta).
   - ≥1 casamento → grava em `consulta_agenda_ur` para cada consulta casada; upsert em `agenda_ur`/`agenda_ur_pagamento` com `origem='WEBHOOK'`.
-  - Deduplicação por `hash_dedupe` reforçada pela `UNIQUE` do banco.
+  - Deduplicação por `hash_dedupe` (`UNIQUE` na tabela).
 
-**Critério de completude (sem sinal de fim, SPEC 03 §5.5):** Celery Beat varre `consulta_agenda WHERE status='PARCIAL'` a cada ~15–30s (usa o índice já definido na SPEC 04):
+**Critério de completude (sem sinal de fim, SPEC03 §5.5):** job `varrer_completude` (Cloud Scheduler, a cada ~30s, por tenant — §6) varre `consulta_agenda WHERE status='PARCIAL'`:
 - `now() - ultima_ur_em > 90s` → `COMPLETA`
 - `now() - iniciada_em > 15min` → `COMPLETA_COM_TIMEOUT` + alerta
 
-**Rate limit (`A08`, 10 consultas online/UFR/dia):** contagem em `consulta_agenda` via índice parcial `(filtro_ufr, iniciada_em) WHERE modo='ONLINE'` — sem contador externo nesse volume inicial. "Dia" é o dia calendário em `America/Sao_Paulo` (fuso de negócio da CERC), não UTC — evita que a virada de dia em UTC libere consultas extras às 21h de Brasília.
+**Rate limit (`A08`, 10 consultas online/UFR/dia):** contagem em `consulta_agenda` (índice em `filtro_ufr, iniciada_em, modo`). "Dia" é o dia calendário em `America/Sao_Paulo` — mesmo fuso já usado em todo o resto da aplicação (`TIME_ZONE` do settings, §3).
+
+**Regra de upsert de `agenda_ur` (frescor):**
+
+```python
+def precedencia_origem(origem: str) -> int:
+    return {"WEBHOOK": 3, "SINCRONO": 2, "ARQUIVO": 1}[origem]
+```
+
+Só sobrescreve se `data_hora_ultima_atualizacao` do dado novo for mais recente, ou empatado com origem de maior precedência — implementado em Python em `apps/agenda/repository.py` (lê a linha existente via `get_db(financiador_id).table("agenda_ur").select()...`, compara, decide `update` ou não), já que `cloudsql_client.py` não tem um `upsert()` condicional embutido (só `insert`/`update`/`delete` simples — ver §11 riscos).
 
 ## 9. Ingestão de arquivo (AP005 / AP005A / AP005B)
 
-- **Chegada:** Celery Beat faz polling em SFTP/Bucket/Connect:Direct por `CERC-AP005[A|B]_{ident_ic}_{data_req}_{seq}_ret.csv[.gz]` em `/informacoes_agendas/saida/`. *(Conexão/credenciais reais são dependência de infra a confirmar — não bloqueia este design.)* `ident_ic` resolve o tenant (financiador → schema).
-- **Idempotência:** checa `agenda.arquivo_agenda_processado` por `(tipo_leiaute, ident_ic, data_req, seq)` antes de processar.
+- **Chegada:** job `importar_ap005` (Cloud Scheduler, por tenant) faz polling em SFTP/Bucket/Connect:Direct por `CERC-AP005[A|B]_{ident_ic}_{data_req}_{seq}_ret.csv[.gz]` em `/informacoes_agendas/saida/`. *(Conexão/credenciais reais são dependência de infra a confirmar — não bloqueia este design.)*
+- **Idempotência:** checa `arquivo_agenda_processado` por `(tipo_leiaute, ident_ic, data_req, seq)` antes de processar.
 - **Streaming:** AP005A/AP005B vêm em `.gz`, descompactados via streaming — nunca materializa o arquivo inteiro em memória.
 - **Detecção de layout** pela contagem de colunas: completo (16 col.) vs. reduzido "sem agenda" (3 col., resultado válido) vs. com/sem coluna 12.16.
-- **Origem** (`AP005`/`AP005A`/`AP005B`) vem do nome do arquivo — um único parser para os três.
+- **Origem** (`AP005`/`AP005A`/`AP005B`) vem do nome do arquivo — um único parser (`apps/agenda/parser_ap005.py`) para os três.
 - `tipoInformacaoPagamento` aceito `1`–`8` em arquivo e webhook; fora disso → `agenda_ur_rejeitada`, nunca exceção não tratada.
 - Linha inválida → `agenda_ur_rejeitada` com motivo; arquivo continua. Alerta se rejeição > 0,5%.
-- **Carga em massa:** `COPY` para tabela temporária *unlogged*, `DISTINCT ON` pela chave natural (ordenando por `data_hora_ultima_atualizacao DESC`), depois um único `INSERT ... ON CONFLICT` com a cláusula de precedência de frescor. Nunca linha a linha.
-- **Prioridade de pipeline:** AP005 (opt-in) antes de AP005A (contrato) antes de AP005B (fumaça), via filas Celery com prioridades distintas.
+- **Carga em massa:** sem `COPY`/tabela temporária (isso pressupõe SQL direto fora do query-builder do `cloudsql_client.py`) — para a fase 1, inserir em lotes (`insert()` com lista de dicts, que `QueryBuilder._exec_insert` já processa em uma única transação) após deduplicar em Python por chave natural (mantendo o registro de maior `data_hora_ultima_atualizacao`). Reavaliar se o volume real de linhas por arquivo tornar isso lento — não otimizar antes de medir.
 
 ## 10. API interna (`/api/v1/agendas/*`, `/api/v1/config/*`, `/api/v1/compliance/*`)
+
+Function-based views (`apps/agenda/views.py`), sem DRF ViewSets. Todas exigem `@jwt_required` (exceto `health`).
 
 | Endpoint | Descrição |
 |---|---|
@@ -140,46 +191,53 @@ Regras:
 | `GET /api/v1/agendas/urs/posicao` | Visão agregada de crédito por UFR/janela, fumaça sempre segregada |
 | `GET/PUT/DELETE /api/v1/config/politicas-consulta` | Política self-service de modo por finalidade |
 | `GET /api/v1/compliance/relatorio` | Relatório de consultas por período/UFR/ator (síncrono/paginado inicialmente) |
+| `POST /api/v1/webhooks/agenda` | Receptor do webhook CERC (§8) |
 
 ## 11. Compliance e auditoria
 
-- `ator` e `origem_ip` preenchidos a partir do JWT/request no momento da consulta, gravados em `consulta_agenda` — retenção de 5 anos, sem expurgo (SPEC 04 §7.1).
+- `ator` (de `request.jwt_claims`) e `origem_ip` preenchidos no momento da consulta, gravados em `consulta_agenda` — retenção de 5 anos, sem expurgo.
 - Relatório exportável evolui para job assíncrono com link de download se o volume exigir — não construído de antemão sem necessidade comprovada.
 
 ## 12. Observabilidade
 
-- Métricas via `django-prometheus`: `agenda_consultas_total{modo,resultado}`, `agenda_cerc_latency_seconds{modo}` (SLO p95: batch < 3s, online < 8s), `agenda_webhook_urs_total`, `agenda_webhook_orfas_total`, `agenda_arquivo_linhas_total{leiaute,resultado}`, `agenda_ur_frescor_horas`.
-- Alertas (Alertmanager) espelhando a tabela de severidade da SPEC 03 §11 — `105801` e "consulta online sem base autorizativa" são os críticos de compliance.
-- Logs estruturados (JSON) com `correlacao_id`; documentos sempre mascarados no log.
+- Métricas: contadores/histogramas equivalentes aos da SPEC03 §11 (`agenda_consultas_total`, `agenda_cerc_latency_seconds`, `agenda_webhook_orfas_total`, `agenda_ur_frescor_horas`) — mecanismo concreto (Cloud Monitoring custom metrics vs. `django-prometheus`) a decidir no plano de observabilidade, não nesta fase.
+- Alertas na configuração de monitoring do GCP, fora do código — mesmo padrão dos irmãos.
+- Logs estruturados (mesmo `LOGGING` do settings dos outros dois serviços) com `correlacao_id`; documentos sempre mascarados no log.
 
 ## 13. Testes
 
-- **Unitários:** regras `A01`–`A10`; parser AP005 (todas as variações de layout); branching de `tipoInformacaoPagamento`; upsert de frescor/precedência; algoritmo de correlação (`99T`, casamento múltiplo).
-- **Integração:** cenários IT-01 a IT-18 da SPEC 03 §12.2, com Postgres real (testcontainers — valida partição/upsert/RLS de fato) e stub da API CERC (respostas gravadas, incluindo os CNPJs de homologação do §5.6 para exercitar o webhook).
-- **Carga:** receptor de webhook a 500 req/s (k6/locust); ingestor com 5M linhas validando memória constante.
+- `pytest` + `pytest-django` (para o test client de views; sem `pytest-django`'s DB fixtures, já que não há Django ORM/DATABASES).
+- **Unitários:** regras `A01`–`A10`; parser AP005 (todas as variações de layout); branching de `tipoInformacaoPagamento`; upsert de frescor/precedência (`apps/agenda/repository.py`); algoritmo de correlação (`99T`, casamento múltiplo); `token_provider` (renovação 80%, single-flight).
+- **Integração:** cenários equivalentes a IT-01–IT-18 da SPEC03 §12.2, contra o banco `agenda` real (dev, `app-db` — ver §14), não testcontainers (mesma prática dos irmãos: sem Docker nesta máquina, conecta direto no Cloud SQL real de dev). Stub da API CERC via `respx` (mesma lib do `contrato-service`).
+- **Carga:** receptor de webhook (k6/locust, alvo a confirmar — Cloud Run escala diferente de um worker Celery dedicado); ingestor com arquivo grande validando memória constante.
 
-## 14. Interfaces assumidas de outros serviços (dependências externas)
+## 14. Interfaces assumidas de outros serviços / pontos em aberto
 
-Estas são **suposições de contrato**, não implementadas por este serviço — validar com os times de `optin-service` antes da integração real:
+1. **JWT:** emitido pelo IdP corporativo (não por `optin-service`). `IAM_JWT_PUBLIC_KEY`/`IAM_JWT_ISSUER` — mesmas env vars que os outros dois serviços já usam.
+2. **Verificação de opt-in ativo (base autorizativa, `A07`):** `optin-service` guarda essa informação no **seu próprio banco**, fisicamente separado do banco do `agenda-service`. **Não existe hoje** um endpoint HTTP do `optin-service` para consultar isso — o único endpoint existente lá é `GET /health`. Este é um gap real, não uma suposição resolvida: sem esse endpoint, `A07` não pode ser verificado antes de chamar a CERC. Ação: confirmar com quem mantém `optin-service` se/quando esse endpoint sai, e qual o contrato (`financiador_id` + UFR + credenciadoras + arranjos + janela → ativo/inativo).
+3. **Lista de tenants para jobs periódicos (§6):** os jobs disparados por Cloud Scheduler precisam saber quais `financiador_id` existem, para iterar um por um. Nenhum serviço irmão resolveu isso ainda publicamente (ver `2026-08-24-multitenancy-design.md §9` do `optin-service`: "provisionamento de tenants... será gerenciado por um front apartado"). Até esse front existir, a lista de tenants de dev/teste é fixa (`12345678000199`, mesmo tenant fixo que os outros dois serviços usam).
+4. **Conexão real (credenciais SFTP/Bucket/Connect:Direct)** para chegada do arquivo AP005 — a definir.
 
-1. Endpoint interno para obter token CERC válido de um financiador (reuso do `TokenProvider`).
-2. Registro de financiadores + decisão de tenant (`tenant_schema`) exposta como claim do JWT.
-3. View `optin.v_base_autorizativa` populada e mantida pelo `optin-service`.
-4. Conexão real (credenciais SFTP/Bucket/Connect:Direct) para chegada do arquivo AP005 — a definir.
+## 15. Riscos conhecidos
 
-## 15. Riscos conhecidos (herdados da SPEC 04 + específicos deste design)
+1. **Upsert condicional sem suporte nativo no `cloudsql_client.py`.** A regra de frescor (§8) precisa de um `SELECT` + comparação em Python antes do `UPDATE`/`INSERT` — não é atômico como o `ON CONFLICT ... WHERE` do Postgres seria. Em alta concorrência (duas origens atualizando a mesma UR quase simultaneamente) existe uma janela de corrida teórica. Mitigação futura, se isso vier a importar na prática: um método `upsert()` dedicado em `cloudsql_client.py` usando SQL bruto (`text()`) para essa tabela específica, mantendo o restante do código no query-builder.
+2. **Sem particionamento.** Se `agenda_ur` crescer para a casa dos milhões/bilhões de linhas como a SPEC04 projeta, será necessário revisitar essa decisão — aceito conscientemente para a fase 1 (§2), mesmo risco que os dois serviços irmãos já carregam.
+3. **Correlação consulta↔webhook é heurística** (SPEC03 §5.4) — se a CERC expuser um id de consulta no futuro, simplifica.
+4. **Gap do item 2 do §14** é bloqueante para produção (não para dev): sem o endpoint de opt-in do `optin-service`, `A07` não pode ser verificado de verdade contra dado real — só localmente com um mock, até esse endpoint existir.
 
-1. `agenda_ur` sem `id` técnico — PK composta de 6 colunas, aceito conscientemente (SPEC 04 §11.1).
-2. Correlação consulta↔webhook é heurística (SPEC 03 §5.4) — se a CERC expuser um id de consulta no futuro, simplifica.
-3. Volume de `agenda_ur_pagamento` pode chegar a 5–10× a estimativa em cenário de ônus empilhados — instrumentar desde o primeiro mês.
-4. RLS em schema compartilhado depende de toda query passar pela sessão com `app.cnpj_financiador` setado corretamente pelo middleware — testar explicitamente o caminho de falha (sessão sem a variável setada deve **negar** acesso, não liberar).
+## 16. Ordem de implementação recomendada (planos)
 
-## 16. Ordem de implementação recomendada
+Mesma granularidade da série do `contrato-service` (~10 planos pequenos, cada um independentemente revisável/testável):
 
-1. Camada de dados (schema `agenda`, migrations `RunSQL`, modelos `managed=False`, repositório de upsert)
-2. Roteamento de tenant (middleware + RLS de teste)
-3. Cliente de consulta CERC (batch primeiro, depois online) + validações `A01`–`A10`
-4. Webhook + correlação + completude
-5. Ingestão de arquivo AP005/AP005A/AP005B
-6. API interna completa + política de consulta self-service
-7. Compliance, observabilidade, testes de carga
+1. **Scaffold** — projeto Django sem ORM, endpoint de health.
+2. **Schema** — `sql/schema/01-agenda-schema.sql` (fase 1, §5) aplicado no Cloud SQL real (banco `agenda`, já provisionado em `app-db`).
+3. **Camada de dados compartilhada** — `shared/cloudsql_client.py`, `shared/secrets.py`, `shared/tenant_config.py` (copiados de `ap-back-optin`).
+4. **Autenticação** — `shared/jwt_auth.py` + `services/cerc/token_provider.py` (copiados de `ap-back-optin`, adaptados ao domínio CERC de agenda).
+5. **Repositório de upsert de `agenda_ur`** (regra de frescor, §8).
+6. **Cliente CERC de consulta** (batch primeiro, depois online) + validações `A01`–`A10` + política de consulta (§7).
+7. **Webhook + correlação + Pub/Sub + job de completude.**
+8. **Ingestão de arquivo AP005.**
+9. **API interna completa** (endpoints restantes de §10) + compliance.
+10. **Observabilidade + testes de carga.**
+
+Planos 3+ são escritos **depois** que o plano anterior estiver implementado e revisado — não faz sentido detalhar o plano 5 antes de saber que o 3 e o 4 realmente funcionaram (mesma prática já adotada nos dois serviços irmãos).
