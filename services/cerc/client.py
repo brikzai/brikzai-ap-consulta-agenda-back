@@ -75,7 +75,7 @@ def _corpo_requisicao(consulta: dict) -> dict:
     return body
 
 
-def _registrar_requisicao(financiador_id: str, correlacao_id: str, request_body: dict, *, http_status, response_body) -> None:
+def _registrar_requisicao(financiador_id: str, correlacao_id: str, request_body: dict, *, http_status, response_body, tentativa: int = 1) -> None:
     get_db(financiador_id).table("cerc_requisicao").insert({
         "id": str(ULID()),
         "recurso": "agenda_consultar",
@@ -83,6 +83,7 @@ def _registrar_requisicao(financiador_id: str, correlacao_id: str, request_body:
         "http_status": http_status,
         "request_body": request_body,
         "response_body": response_body,
+        "tentativa": tentativa,
     }).execute()
 
 
@@ -104,10 +105,11 @@ def _tratar_erro_cerc(http_status: int, corpo_resposta) -> list:
     raise CercConsultaInvalidaError(codigo or str(http_status), mensagem)
 
 
-def _chamar_cerc(financiador_id: str, consulta: dict, *, online: bool, tentativa_401: bool = False) -> list:
+def _chamar_cerc(financiador_id: str, consulta: dict, *, online: bool, tentativa_401: bool = False, correlacao_id: str = None, tentativa: int = 1) -> list:
     token = get_cerc_token(financiador_id)
     body = _corpo_requisicao(consulta)
-    correlacao_id = str(uuid.uuid4())
+    if correlacao_id is None:
+        correlacao_id = str(uuid.uuid4())
 
     try:
         response = httpx.post(
@@ -118,15 +120,15 @@ def _chamar_cerc(financiador_id: str, consulta: dict, *, online: bool, tentativa
             timeout=30.0,
         )
     except httpx.HTTPError as exc:
-        _registrar_requisicao(financiador_id, correlacao_id, body, http_status=None, response_body=None)
+        _registrar_requisicao(financiador_id, correlacao_id, body, http_status=None, response_body=None, tentativa=tentativa)
         raise CercConsultaRetentavelError("105003", f"falha de comunicação com a CERC: {type(exc).__name__}") from None
+
+    corpo_resposta = response.json() if response.content else None
+    _registrar_requisicao(financiador_id, correlacao_id, body, http_status=response.status_code, response_body=corpo_resposta, tentativa=tentativa)
 
     if response.status_code == 401 and not tentativa_401:
         invalidate_token(financiador_id)
-        return _chamar_cerc(financiador_id, consulta, online=online, tentativa_401=True)
-
-    corpo_resposta = response.json() if response.content else None
-    _registrar_requisicao(financiador_id, correlacao_id, body, http_status=response.status_code, response_body=corpo_resposta)
+        return _chamar_cerc(financiador_id, consulta, online=online, tentativa_401=True, correlacao_id=correlacao_id, tentativa=2)
 
     if response.status_code == 200:
         return corpo_resposta or []

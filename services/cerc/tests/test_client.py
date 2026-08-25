@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 import httpx
 import pytest
 import respx
+from ulid import ULID
 
 from apps.agenda import repository, validation
 from services.cerc import client
@@ -44,7 +45,7 @@ def _ambiente(monkeypatch):
     _limpar()
     db = get_db(FINANCIADOR_TESTE)
     db.table("politica_consulta").insert({
-        "id": "pol-teste-client", "motivo": "TESTE-CLIENT",
+        "id": str(ULID()), "motivo": "TESTE-CLIENT",
         "modos_permitidos": ["BATCH", "ONLINE"], "ativo": True,
     }).execute()
     yield
@@ -145,20 +146,32 @@ def test_consultar_agenda_online_abre_parcial():
 
 @respx.mock
 def test_consultar_agenda_persiste_uma_linha_por_titular():
-    titulares = [_titular(CNPJ_VALIDO, 500.0), _titular(CPF_VALIDO, 500.0)]
+    titulares = [
+        _titular(CNPJ_VALIDO, 600.0, valorBloqueado=100.0, valorLivre=500.0),
+        _titular(CPF_VALIDO, 400.0, valorBloqueado=50.0, valorLivre=350.0),
+    ]
     respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc(titulares=titulares)))
 
     client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
 
     db = get_db(FINANCIADOR_TESTE)
     linhas = (
-        db.table("agenda_ur").select("documento_titular,valor_total_ur")
+        db.table("agenda_ur").select("documento_titular,valor_total_ur,valor_constituido_total,valor_bloqueado,valor_livre")
         .eq("data_liquidacao", "2026-09-20")
         .eq("entidade_registradora", "22246686000196")
         .execute().data
     )
     assert {r["documento_titular"] for r in linhas} == {CNPJ_VALIDO, CPF_VALIDO}
     assert all(r["valor_total_ur"] == 1000 for r in linhas)  # valorTotalUR é do nível da UR, igual pros dois titulares
+    # Verify per-titular values are persisted correctly
+    cnpj_row = [r for r in linhas if r["documento_titular"] == CNPJ_VALIDO][0]
+    assert cnpj_row["valor_constituido_total"] == 600.0
+    assert cnpj_row["valor_bloqueado"] == 100.0
+    assert cnpj_row["valor_livre"] == 500.0
+    cpf_row = [r for r in linhas if r["documento_titular"] == CPF_VALIDO][0]
+    assert cpf_row["valor_constituido_total"] == 400.0
+    assert cpf_row["valor_bloqueado"] == 50.0
+    assert cpf_row["valor_livre"] == 350.0
 
 
 @respx.mock
@@ -244,3 +257,85 @@ def test_consultar_agenda_grava_cerc_requisicao_antes_de_interpretar_resposta():
     requisicoes = db.table("cerc_requisicao").select("*").eq("recurso", "agenda_consultar").execute().data
     assert len(requisicoes) == 1
     assert requisicoes[0]["http_status"] == 200
+
+
+@respx.mock
+def test_consultar_agenda_traduz_pagamento():
+    titulares = [
+        _titular(
+            CNPJ_VALIDO,
+            1000.0,
+            pagamentos=[
+                {
+                    "tipoInformacaoPagamento": "AGENDA",
+                    "indicadorEfeitosContrato": "SIM",
+                    "regrasDivisao": "PROPORCIONAL",
+                    "valorOnerado": 500.0,
+                    "valorConstituidoEfeito": 450.0,
+                    "valorAPagar": 450.0,
+                    "beneficiario": "Banco Teste",
+                    "dataLiquidacaoEfetiva": "2026-09-15",
+                    "valorLiquidacaoEfetiva": 450.0,
+                    "motivoDeNaoPagamento": None,
+                    "domicilioPagamento": {
+                        "banco": "001",
+                        "agencia": "0001",
+                        "conta": "123456",
+                    },
+                }
+            ],
+        )
+    ]
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc(titulares=titulares)))
+
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    pagamentos = (
+        db.table("agenda_ur_pagamento").select("*")
+        .eq("data_liquidacao", "2026-09-20")
+        .eq("entidade_registradora", "22246686000196")
+        .execute().data
+    )
+    assert len(pagamentos) == 1
+    pag = pagamentos[0]
+    assert pag["tipo_informacao_pagamento"] == "AGENDA"
+    assert pag["indicador_efeitos_contrato"] == "SIM"
+    assert pag["identificador_cerc_contrato"] is None
+    assert pag["regras_divisao"] == "PROPORCIONAL"
+    assert pag["valor_onerado"] == 500.0
+    assert pag["valor_constituido_efeito"] == 450.0
+    assert pag["valor_a_pagar"] == 450.0
+    assert pag["beneficiario"] == "Banco Teste"
+    assert pag["data_liquidacao_efetiva"] == date(2026, 9, 15)
+    assert pag["valor_liquidacao_efetiva"] == 450.0
+    assert pag["motivo_nao_pagamento"] is None
+    assert pag["domicilio"] == {"banco": "001", "agencia": "0001", "conta": "123456"}
+
+
+@respx.mock
+def test_consultar_agenda_correlacao_id_e_tentativa_em_401_retry(monkeypatch):
+    chamadas_invalidacao = []
+    monkeypatch.setattr(client, "invalidate_token", lambda financiador_id: chamadas_invalidacao.append(financiador_id))
+
+    route = respx.post(URL_CONSULTAR).mock(
+        side_effect=[
+            httpx.Response(401, json={"erro": "token expirado"}),
+            httpx.Response(200, json=_resposta_cerc()),
+        ]
+    )
+
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    requisicoes = (
+        db.table("cerc_requisicao").select("correlacao_id,tentativa")
+        .eq("recurso", "agenda_consultar")
+        .execute().data
+    )
+    assert len(requisicoes) == 2
+    # Both requests should share the same correlacao_id
+    assert requisicoes[0]["correlacao_id"] == requisicoes[1]["correlacao_id"]
+    # First attempt should have tentativa=1, second should have tentativa=2
+    assert requisicoes[0]["tentativa"] == 1
+    assert requisicoes[1]["tentativa"] == 2
