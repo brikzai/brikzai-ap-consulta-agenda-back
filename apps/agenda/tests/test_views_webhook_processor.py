@@ -189,6 +189,20 @@ def test_processor_com_consulta_casada_persiste_ur_e_vincula():
         _limpar(webhook_inbox_id=webhook_id, consulta_ids=[consulta_id])
 
 
+def test_processor_evento_malformado_marca_erro_e_retorna_204():
+    payload = _payload({"entidadeRegistradora": "x"})  # faltam campos obrigatórios (ex.: documentoUsuarioFinalRecebedor)
+    webhook_id = _criar_webhook_inbox(payload)
+    try:
+        response = Client().post(URL, data=_push_envelope(webhook_id), content_type="application/json")
+        assert response.status_code == 204
+
+        linha = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("id", webhook_id).execute().data[0]
+        assert linha["processado_em"] is not None
+        assert linha["erro"] is not None
+    finally:
+        _limpar(webhook_inbox_id=webhook_id)
+
+
 def test_processor_casa_com_multiplas_consultas():
     consulta_a = _criar_consulta("proc-2a")
     consulta_b = _criar_consulta("proc-2b", motivo="OUTRO-MOTIVO")

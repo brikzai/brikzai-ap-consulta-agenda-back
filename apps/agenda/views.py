@@ -189,29 +189,55 @@ def processar_webhook_agenda(request):
         db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
         return JsonResponse({}, status=204)
 
-    candidatas = encontrar_consultas_candidatas(financiador_id, evento)
-    cabecalho, pagamentos = _traduzir_evento_webhook(evento)
+    try:
+        candidatas = encontrar_consultas_candidatas(financiador_id, evento)
+        cabecalho, pagamentos = _traduzir_evento_webhook(evento)
 
-    if not candidatas:
-        db.table("agenda_ur_orfa").insert({"payload": payload}).execute()
-    else:
-        upsert_agenda_ur(financiador_id, cabecalho, pagamentos)
-        agora = datetime.now(timezone.utc)
-        for consulta in candidatas:
-            db.table("consulta_agenda_ur").insert({
-                "consulta_id": consulta["id"],
-                "entidade_registradora": cabecalho["entidade_registradora"],
-                "cnpj_credenciadora": cabecalho["cnpj_credenciadora"],
-                "documento_ufr": cabecalho["documento_ufr"],
-                "documento_titular": cabecalho["documento_titular"],
-                "codigo_arranjo": cabecalho["codigo_arranjo"],
-                "data_liquidacao": cabecalho["data_liquidacao"],
-                "origem": "WEBHOOK",
-            }).execute()
-            db.table("consulta_agenda").update({
-                "qtd_urs_webhook": consulta["qtd_urs_webhook"] + 1,
-                "ultima_ur_em": agora,
-            }).eq("id", consulta["id"]).execute()
+        if not candidatas:
+            logger.warning(
+                "[Processor] Nenhuma consulta casou com o evento (webhook_inbox_id=%s, financiador=%s, "
+                "documentoUsuarioFinalRecebedor=%s, dataLiquidacao=%s) — indo para agenda_ur_orfa",
+                webhook_inbox_id, financiador_id,
+                evento.get("documentoUsuarioFinalRecebedor"), evento.get("dataLiquidacao"),
+            )
+            db.table("agenda_ur_orfa").insert({"payload": payload}).execute()
+        else:
+            upsert_agenda_ur(financiador_id, cabecalho, pagamentos)
+            agora = datetime.now(timezone.utc)
+            for consulta in candidatas:
+                try:
+                    db.table("consulta_agenda_ur").insert({
+                        "consulta_id": consulta["id"],
+                        "entidade_registradora": cabecalho["entidade_registradora"],
+                        "cnpj_credenciadora": cabecalho["cnpj_credenciadora"],
+                        "documento_ufr": cabecalho["documento_ufr"],
+                        "documento_titular": cabecalho["documento_titular"],
+                        "codigo_arranjo": cabecalho["codigo_arranjo"],
+                        "data_liquidacao": cabecalho["data_liquidacao"],
+                        "origem": "WEBHOOK",
+                    }).execute()
+                except DBAPIError as erro:
+                    if not _violacao_unique(erro):
+                        raise
+                    continue  # já vinculado por uma tentativa anterior (redelivery do Pub/Sub) — não reincrementa
+                db.table("consulta_agenda").update({
+                    "qtd_urs_webhook": consulta["qtd_urs_webhook"] + 1,
+                    "ultima_ur_em": agora,
+                }).eq("id", consulta["id"]).eq("status", "PARCIAL").execute()
+            logger.info(
+                "[Processor] Evento correlacionado (webhook_inbox_id=%s, financiador=%s, consultas_casadas=%d)",
+                webhook_inbox_id, financiador_id, len(candidatas),
+            )
+    except Exception as erro:
+        logger.exception(
+            "[Processor] Falha ao processar evento agenda (webhook_inbox_id=%s, financiador=%s)",
+            webhook_inbox_id, financiador_id,
+        )
+        db.table("webhook_inbox").update({
+            "processado_em": datetime.now(timezone.utc),
+            "erro": str(erro),
+        }).eq("id", webhook_inbox_id).execute()
+        return JsonResponse({}, status=204)
 
     db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
     return JsonResponse({}, status=204)

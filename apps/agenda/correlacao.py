@@ -16,22 +16,20 @@ def _lista_contem(lista, valor: str) -> bool:
 
 def encontrar_consultas_candidatas(financiador_id: str, evento: dict) -> list:
     db = get_db(financiador_id)
-    candidatas = (
-        db.table("consulta_agenda").select("*")
-        .eq("status", "PARCIAL").eq("modo", "ONLINE")
-        .execute().data
-    )
-
     documento_ufr = evento["documentoUsuarioFinalRecebedor"]
     documento_titular = evento.get("documentoTitular")
     credenciadora = evento["instituicaoCredenciadora"]
     arranjo = evento["codigoArranjoPagamento"]
     data_liquidacao = date.fromisoformat(evento["dataLiquidacao"])
 
+    candidatas = (
+        db.table("consulta_agenda").select("*")
+        .eq("status", "PARCIAL").eq("modo", "ONLINE").eq("filtro_ufr", documento_ufr)
+        .execute().data
+    )
+
     casadas = []
     for consulta in candidatas:
-        if consulta["filtro_ufr"] != documento_ufr:
-            continue
         if consulta["filtro_titular"] and documento_titular and consulta["filtro_titular"] != documento_titular:
             continue
         if not _lista_contem(consulta["filtro_credenciadoras"], credenciadora):
