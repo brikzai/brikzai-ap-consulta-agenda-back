@@ -6,6 +6,7 @@ sqlalchemy>=2.0
 pg8000
 cloud-sql-python-connector[pg8000]
 google-cloud-secret-manager
+google-cloud-pubsub
 httpx
 pyjwt[crypto]
 python-ulid
