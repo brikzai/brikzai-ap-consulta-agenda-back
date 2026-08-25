@@ -237,7 +237,7 @@ def varrer_completude(request):
 
     for financiador_id in _TENANTS_JOBS_PERIODICOS:
         db = get_db(financiador_id)
-        parciais = db.table("consulta_agenda").select("*").eq("status", "PARCIAL").execute().data
+        parciais = db.table("consulta_agenda").select("*").eq("status", "PARCIAL").eq("modo", "ONLINE").execute().data
 
         for consulta in parciais:
             referencia = consulta["ultima_ur_em"] or consulta["iniciada_em"]

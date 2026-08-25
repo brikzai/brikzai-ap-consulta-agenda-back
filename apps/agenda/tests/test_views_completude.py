@@ -11,9 +11,9 @@ URL = "/api/v1/jobs/varrer-completude"
 UFR_TESTE = "55555555000155"
 
 
-def _consulta(id_, *, iniciada_em, ultima_ur_em=None, status="PARCIAL"):
+def _consulta(id_, *, iniciada_em, ultima_ur_em=None, status="PARCIAL", modo="ONLINE"):
     return {
-        "id": id_, "modo": "ONLINE", "status": status,
+        "id": id_, "modo": modo, "status": status,
         "filtro_ufr": UFR_TESTE, "filtro_credenciadoras": ["99T"], "filtro_arranjos": ["99T"],
         "filtro_data_inicio": date(2026, 9, 1), "filtro_data_fim": date(2026, 9, 30),
         "base_autorizativa_tipo": "OPTIN", "base_autorizativa_id": "opt_1",
@@ -93,3 +93,17 @@ def test_ignora_consulta_ja_completa():
 
     consulta = db.table("consulta_agenda").select("*").eq("id", "comp-4").execute().data[0]
     assert consulta["status"] == "COMPLETA"
+
+
+def test_ignora_consulta_batch_mesmo_que_parcial_e_velha():
+    agora = datetime.now(timezone.utc)
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("consulta_agenda").insert(_consulta(
+        "comp-5", iniciada_em=agora - timedelta(minutes=20), ultima_ur_em=agora - timedelta(seconds=100), modo="BATCH",
+    )).execute()
+
+    response = Client().post(URL)
+    assert response.status_code == 200
+
+    consulta = db.table("consulta_agenda").select("*").eq("id", "comp-5").execute().data[0]
+    assert consulta["status"] == "PARCIAL"
