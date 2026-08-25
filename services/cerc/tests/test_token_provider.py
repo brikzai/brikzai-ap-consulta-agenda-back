@@ -159,6 +159,72 @@ def test_fetch_token_nao_mantem_client_secret_no_frame_apos_erro():
         pytest.fail("CercTokenError não foi levantada")
 
 
+def test_fetch_token_sanitiza_config_sem_client_secret(monkeypatch):
+    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+        "cerc_client_id": "client-123",
+    }))
+
+    import shared.tenant_config as tenant_config_module
+    tenant_config_module._cache.clear()
+
+    with pytest.raises(token_provider.CercTokenError) as exc_info:
+        token_provider.get_cerc_token(FINANCIADOR_TESTE)
+
+    exc = exc_info.value
+    assert "client-123" not in str(exc)
+    assert "client-123" not in repr(exc)
+    assert "cerc_client_secret" in str(exc)
+    assert FINANCIADOR_TESTE in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+
+
+def test_fetch_token_sanitiza_config_sem_client_id(monkeypatch):
+    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+        "cerc_client_secret": "segredo-orfao",
+    }))
+
+    import shared.tenant_config as tenant_config_module
+    tenant_config_module._cache.clear()
+
+    with pytest.raises(token_provider.CercTokenError) as exc_info:
+        token_provider.get_cerc_token(FINANCIADOR_TESTE)
+
+    exc = exc_info.value
+    assert "segredo-orfao" not in str(exc)
+    assert "segredo-orfao" not in repr(exc)
+    assert "cerc_client_id" in str(exc)
+    assert FINANCIADOR_TESTE in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+
+
+def test_fetch_token_nao_mantem_config_no_frame_apos_chave_ausente(monkeypatch):
+    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+        "cerc_client_id": "client-123",
+    }))
+
+    import shared.tenant_config as tenant_config_module
+    tenant_config_module._cache.clear()
+
+    try:
+        token_provider._fetch_token(FINANCIADOR_TESTE)
+    except token_provider.CercTokenError as exc:
+        tb = exc.__traceback__
+        found_fetch_frame = False
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code.co_name == "_fetch_token":
+                found_fetch_frame = True
+                assert "client_secret" not in frame.f_locals
+                assert "client_id" not in frame.f_locals
+                assert "config" not in frame.f_locals
+            tb = tb.tb_next
+        assert found_fetch_frame
+    else:
+        pytest.fail("CercTokenError não foi levantada")
+
+
 @respx.mock
 def test_get_cerc_token_isola_cache_entre_tenants(monkeypatch):
     monkeypatch.setenv("TENANT_99999999000191_CONFIG", json.dumps({

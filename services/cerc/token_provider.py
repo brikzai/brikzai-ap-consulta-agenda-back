@@ -47,24 +47,32 @@ class CercTokenError(Exception):
 
 def _fetch_token(financiador_id: str) -> dict:
     config = get_tenant_config(financiador_id)
-    client_id = config["cerc_client_id"]
-    client_secret = config["cerc_client_secret"]
-    del config
+    client_id = client_secret = None
     try:
-        response = httpx.post(
-            os.environ["CERC_AUTH_URL"],
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=10.0,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise CercTokenError(
-            f"falha ao obter token CERC para financiador {financiador_id}: {type(exc).__name__}"
-        ) from None
+        try:
+            client_id = config["cerc_client_id"]
+            client_secret = config["cerc_client_secret"]
+        except KeyError as exc:
+            raise CercTokenError(
+                f"config do tenant {financiador_id} sem a chave {exc}"
+            ) from None
+        finally:
+            del config
+        try:
+            response = httpx.post(
+                os.environ["CERC_AUTH_URL"],
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise CercTokenError(
+                f"falha ao obter token CERC para financiador {financiador_id}: {type(exc).__name__}"
+            ) from None
     finally:
         del client_id, client_secret
     return response.json()
