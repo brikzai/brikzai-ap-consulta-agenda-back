@@ -119,9 +119,16 @@ def test_processor_webhook_inbox_nao_encontrado_retorna_404():
 
 def test_processor_ja_processado_e_idempotente():
     webhook_id = _criar_webhook_inbox(_payload(_evento_agenda()), processado_em=datetime(2026, 8, 25, 12, 5, tzinfo=timezone.utc))
+    db = get_db(FINANCIADOR_TESTE)
+    antes = db.table("agenda_ur_orfa").select("id").execute().data
+    ids_antes = {r["id"] for r in antes}
     try:
         response = Client().post(URL, data=_push_envelope(webhook_id), content_type="application/json")
         assert response.status_code == 204
+
+        depois = db.table("agenda_ur_orfa").select("*").execute().data
+        novas = [r for r in depois if r["id"] not in ids_antes]
+        assert len(novas) == 0  # nenhuma escrita deve ter ocorrido
     finally:
         _limpar(webhook_inbox_id=webhook_id)
 
