@@ -8,6 +8,7 @@ from ulid import ULID
 
 from apps.agenda import repository, validation
 from services.cerc import client
+from services.cerc.token_provider import CercTokenError
 from shared.cloudsql_client import get_db
 
 FINANCIADOR_TESTE = "12345678000199"
@@ -480,3 +481,19 @@ def test_consultar_agenda_isola_ur_malformada_sem_quebrar_o_lote():
     assert len(novas) >= 1
     for r in novas:
         db.table("agenda_ur_rejeitada").delete().eq("id", r["id"]).execute()
+
+
+def test_consultar_agenda_fecha_consulta_em_erro_quando_token_falha(monkeypatch):
+    def _falha_token(financiador_id):
+        raise CercTokenError("token indisponível")
+
+    monkeypatch.setattr(client, "get_cerc_token", _falha_token)
+
+    with pytest.raises(CercTokenError):
+        client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    consultas = db.table("consulta_agenda").select("*").eq("filtro_ufr", CNPJ_VALIDO).execute().data
+    assert len(consultas) == 1
+    assert consultas[0]["status"] == "ERRO"
+    assert consultas[0]["encerrada_em"] is not None

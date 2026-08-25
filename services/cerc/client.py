@@ -261,7 +261,11 @@ def consultar_agenda(financiador_id: str, consulta: dict) -> dict:
 
     try:
         agendas = _chamar_cerc(financiador_id, consulta, online=online)
-    except CercConsultaError:
+    except Exception:
+        # Qualquer falha ao obter o token ou chamar a CERC (não só
+        # CercConsultaError — inclui CercTokenError e erros de banco na
+        # própria trilha de auditoria) precisa fechar a consulta como ERRO,
+        # senão ela fica presa em PARCIAL para sempre (design doc §15 risco 15).
         _fechar_consulta_agenda(financiador_id, consulta_id, status="ERRO", qtd_urs=0)
         raise
 
