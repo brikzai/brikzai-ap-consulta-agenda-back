@@ -195,3 +195,69 @@ def test_upsert_remove_pagamento_obsoleto_fora_do_lote_atual():
     ).execute().data
     tipos_restantes = {r["tipo_informacao_pagamento"] for r in restantes}
     assert tipos_restantes == {"1"}
+
+
+def test_upsert_pagamento_normaliza_indicador_none_para_vazio():
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    pagamento = _pagamento("4", indicador_efeitos_contrato=None)
+
+    resultado = upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "SINCRONO"), pagamentos=[pagamento])
+
+    assert resultado["pagamentos"][0]["indicador_efeitos_contrato"] == ""
+
+
+def test_upsert_pagamento_com_indicador_nao_vazio_e_limpo_pela_chave_completa():
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    com_efeito = _pagamento("4", indicador_efeitos_contrato="X")
+    sem_efeito = _pagamento("4", indicador_efeitos_contrato="")
+    upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "SINCRONO"), pagamentos=[com_efeito, sem_efeito])
+
+    upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t2, "WEBHOOK"), pagamentos=[sem_efeito])
+
+    restantes = _com_filtros(
+        get_db(FINANCIADOR_TESTE).table("agenda_ur_pagamento").select("indicador_efeitos_contrato"),
+        CHAVE_TESTE, _CHAVE_UR,
+    ).execute().data
+    assert {r["indicador_efeitos_contrato"] for r in restantes} == {""}
+
+
+def test_upsert_evento_liquidacao_registra_discriminador_do_pagamento():
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    pendente = _pagamento("5", indicador_efeitos_contrato="")
+    upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "SINCRONO"), pagamentos=[pendente])
+
+    liquidado = _pagamento("5", indicador_efeitos_contrato="", data_liquidacao_efetiva="2026-09-15", valor_liquidacao_efetiva=1000)
+    resultado = upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t2, "WEBHOOK"), pagamentos=[liquidado])
+
+    evento = next(e for e in resultado["eventos"] if e["tipo_evento"] == "LIQUIDACAO")
+    assert evento["tipo_informacao_pagamento"] == "5"
+    assert evento["indicador_efeitos_contrato"] == ""
+
+
+def test_upsert_retorna_criado_true_na_primeira_vez_e_false_depois():
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    primeiro = upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "SINCRONO"), pagamentos=[])
+    assert primeiro["criado"] is True
+
+    segundo = upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t2, "WEBHOOK"), pagamentos=[])
+    assert segundo["criado"] is False
+
+
+def test_upsert_retorna_pagamentos_vazio_quando_lote_e_descartado():
+    t_recente = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    t_antigo = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t_recente, "SINCRONO"), pagamentos=[])
+
+    resultado = upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t_antigo, "ARQUIVO"), pagamentos=[_pagamento("1")])
+
+    assert resultado["sobrescrito"] is False
+    assert resultado["pagamentos"] == []
+
+
+def test_upsert_origem_invalida_falha_rapido():
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+    with pytest.raises(KeyError):
+        upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "sincrono"), pagamentos=[])

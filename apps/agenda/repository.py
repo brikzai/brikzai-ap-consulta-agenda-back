@@ -74,7 +74,10 @@ def _deve_sobrescrever(existente: Optional[dict], nova_data_hora: datetime, nova
     return False
 
 
-def _registrar_evento(db, chave: dict, tipo_evento: str, origem: str, valor, ocorrido_em: datetime) -> dict:
+def _registrar_evento(
+    db, chave: dict, tipo_evento: str, origem: str, valor, ocorrido_em: datetime,
+    *, tipo_informacao_pagamento=None, indicador_efeitos_contrato: str = "",
+) -> dict:
     evento = {campo: chave[campo] for campo in _CHAVE_UR}
     evento.update({
         "id": str(ULID()),
@@ -82,6 +85,8 @@ def _registrar_evento(db, chave: dict, tipo_evento: str, origem: str, valor, oco
         "origem": origem,
         "valor": valor,
         "ocorrido_em": ocorrido_em,
+        "tipo_informacao_pagamento": tipo_informacao_pagamento,
+        "indicador_efeitos_contrato": indicador_efeitos_contrato,
     })
     return db.table("agenda_ur_evento").insert(evento).execute().data[0]
 
@@ -108,12 +113,17 @@ def _eventos_do_cabecalho(db, chave: dict, origem: str, existente: Optional[dict
 def _upsert_pagamento(db, chave: dict, pagamento: dict, ocorrido_em: datetime):
     chave_pagamento = dict(chave)
     chave_pagamento["tipo_informacao_pagamento"] = pagamento["tipo_informacao_pagamento"]
-    chave_pagamento["indicador_efeitos_contrato"] = pagamento.get("indicador_efeitos_contrato", "")
+    chave_pagamento["indicador_efeitos_contrato"] = pagamento.get("indicador_efeitos_contrato") or ""
 
     campos_chave = _CHAVE_UR + _CHAVE_PAGAMENTO_EXTRA
     existente = _buscar_um(db, "agenda_ur_pagamento", chave_pagamento, campos_chave)
 
-    dados = {**chave_pagamento, **pagamento, "atualizado_em": ocorrido_em}
+    dados = {
+        **chave_pagamento,
+        **pagamento,
+        "atualizado_em": ocorrido_em,
+        "indicador_efeitos_contrato": chave_pagamento["indicador_efeitos_contrato"],
+    }
     if existente is None:
         gravado = db.table("agenda_ur_pagamento").insert(dados).execute().data[0]
     else:
@@ -149,11 +159,13 @@ def upsert_agenda_ur(financiador_id: str, cabecalho: dict, pagamentos: list) -> 
     db = get_db(financiador_id)
     chave = {campo: cabecalho[campo] for campo in _CHAVE_UR}
     origem = cabecalho["origem"]
+    precedencia_origem(origem)  # valida cedo — erro claro se origem for inválida, em vez de um KeyError tardio num empate
     ocorrido_em = cabecalho["data_hora_ultima_atualizacao"]
 
     existente = _buscar_um(db, "agenda_ur", chave, _CHAVE_UR)
+    criado = existente is None
     if not _deve_sobrescrever(existente, ocorrido_em, origem):
-        return {"sobrescrito": False, "agenda_ur": existente, "eventos": []}
+        return {"sobrescrito": False, "agenda_ur": existente, "pagamentos": [], "eventos": []}
 
     novo = _upsert_cabecalho(db, chave, cabecalho, existente, ocorrido_em)
     eventos = _eventos_do_cabecalho(db, chave, origem, existente, novo, ocorrido_em)
@@ -171,8 +183,12 @@ def upsert_agenda_ur(financiador_id: str, cabecalho: dict, pagamentos: list) -> 
             valor = gravado.get("valor_liquidacao_efetiva")
             if valor is None:
                 valor = gravado.get("valor_a_pagar")
-            eventos.append(_registrar_evento(db, chave, "LIQUIDACAO", origem, valor, ocorrido_em))
+            eventos.append(_registrar_evento(
+                db, chave, "LIQUIDACAO", origem, valor, ocorrido_em,
+                tipo_informacao_pagamento=chave_pagamento["tipo_informacao_pagamento"],
+                indicador_efeitos_contrato=chave_pagamento["indicador_efeitos_contrato"],
+            ))
 
     _limpar_pagamentos_obsoletos(db, chave, chaves_do_lote)
 
-    return {"sobrescrito": True, "agenda_ur": novo, "pagamentos": pagamentos_gravados, "eventos": eventos}
+    return {"sobrescrito": True, "agenda_ur": novo, "pagamentos": pagamentos_gravados, "eventos": eventos, "criado": criado}
