@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, timezone
 
 import httpx
@@ -339,3 +340,143 @@ def test_consultar_agenda_correlacao_id_e_tentativa_em_401_retry(monkeypatch):
     # First attempt should have tentativa=1, second should have tentativa=2
     assert requisicoes[0]["tentativa"] == 1
     assert requisicoes[1]["tentativa"] == 2
+
+
+@respx.mock
+def test_consultar_agenda_envia_online_true_no_modo_online():
+    route = respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(modo="ONLINE"))
+    assert route.calls.last.request.url.params["online"] == "true"
+
+
+@respx.mock
+def test_consultar_agenda_envia_online_false_no_modo_batch():
+    route = respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(modo="BATCH"))
+    assert route.calls.last.request.url.params["online"] == "false"
+
+
+@respx.mock
+def test_consultar_agenda_monta_corpo_da_requisicao_corretamente():
+    route = respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
+
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(
+        documento_titular=CPF_VALIDO, tipo_avaliacao="avaliacao_agenda_basica_ap",
+        participante="99999999000191", carteira="CARTEIRA-01",
+    ))
+
+    corpo = json.loads(route.calls.last.request.content)
+    assert corpo["documentoUsuarioFinalRecebedor"] == CNPJ_VALIDO
+    assert corpo["documentoTitular"] == CPF_VALIDO
+    assert corpo["dataInicio"] == "2026-09-01"
+    assert corpo["dataFim"] == "2026-09-30"
+    assert corpo["tipoAvaliacao"] == "avaliacao_agenda_basica_ap"
+    assert corpo["participante"] == "99999999000191"
+    assert corpo["carteira"] == "CARTEIRA-01"
+
+
+@respx.mock
+def test_consultar_agenda_erro_de_conexao_e_retentavel_e_fecha_consulta_em_erro():
+    respx.post(URL_CONSULTAR).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    with pytest.raises(client.CercConsultaRetentavelError):
+        client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    consultas = db.table("consulta_agenda").select("*").eq("filtro_ufr", CNPJ_VALIDO).execute().data
+    assert len(consultas) == 1
+    assert consultas[0]["status"] == "ERRO"
+    assert consultas[0]["encerrada_em"] is not None
+
+    requisicoes = db.table("cerc_requisicao").select("*").eq("recurso", "agenda_consultar").execute().data
+    assert len(requisicoes) == 1
+    assert requisicoes[0]["http_status"] is None
+
+
+@respx.mock
+def test_consultar_agenda_corpo_de_erro_nao_conforme_nao_quebra():
+    respx.post(URL_CONSULTAR).mock(
+        return_value=httpx.Response(500, content=b"<html>gateway error</html>", headers={"content-type": "text/html"})
+    )
+
+    with pytest.raises(client.CercConsultaRetentavelError):
+        client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    requisicoes = db.table("cerc_requisicao").select("*").eq("recurso", "agenda_consultar").execute().data
+    assert len(requisicoes) == 1
+    assert requisicoes[0]["http_status"] == 500
+
+
+@respx.mock
+def test_consultar_agenda_codigo_105801_e_critico():
+    respx.post(URL_CONSULTAR).mock(
+        return_value=httpx.Response(403, json={"erros": [{"codigo": 105801, "mensagem": "acesso negado"}]})
+    )
+    with pytest.raises(client.CercConsultaCriticaError):
+        client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+
+@respx.mock
+def test_consultar_agenda_persiste_trilha_de_compliance():
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
+
+    resultado = client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(
+        ator="analista@empresa.com", origem_ip="10.0.0.1",
+        base_autorizativa={"tipo": "CONTRATO", "id": "ctr_1"},
+    ))
+
+    db = get_db(FINANCIADOR_TESTE)
+    consulta = db.table("consulta_agenda").select("*").eq("id", resultado["consultaId"]).execute().data[0]
+    assert consulta["ator"] == "analista@empresa.com"
+    assert consulta["origem_ip"] == "10.0.0.1"
+    assert consulta["base_autorizativa_tipo"] == "CONTRATO"
+    assert consulta["base_autorizativa_id"] == "ctr_1"
+
+
+@respx.mock
+def test_consultar_agenda_usa_pagamentos_do_nivel_da_ur_quando_titular_nao_tem():
+    resposta = _resposta_cerc()
+    ur = resposta[0]["unidadesRecebiveis"][0]
+    ur["pagamentos"] = [{
+        "tipoInformacaoPagamento": 7,
+        "domicilioPagamento": {"tipoConta": "CC"},
+        "valorAPagar": 1000.0,
+    }]
+    ur["titulares"][0]["pagamentos"] = []
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=resposta))
+
+    client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    pagamentos = repository._com_filtros(
+        db.table("agenda_ur_pagamento").select("*"), CHAVE_UR_TESTE, repository._CHAVE_UR
+    ).execute().data
+    assert len(pagamentos) == 1
+    assert pagamentos[0]["tipo_informacao_pagamento"] == "7"
+
+
+@respx.mock
+def test_consultar_agenda_isola_ur_malformada_sem_quebrar_o_lote():
+    db = get_db(FINANCIADOR_TESTE)
+    antes = db.table("agenda_ur_rejeitada").select("id").execute().data
+    ids_antes = {r["id"] for r in antes}
+
+    resposta = _resposta_cerc()
+    ur_malformada = {"dataLiquidacao": "2026-09-21"}  # sem titulares/constituicao/etc — KeyError na tradução
+    resposta[0]["unidadesRecebiveis"].append(ur_malformada)
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=resposta))
+
+    resultado = client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    assert resultado["status"] == "COMPLETA"
+    ur_boa = repository._com_filtros(
+        db.table("agenda_ur").select("*"), CHAVE_UR_TESTE, repository._CHAVE_UR
+    ).execute().data
+    assert len(ur_boa) == 1  # a UR válida foi persistida mesmo com a malformada no mesmo lote
+
+    depois = db.table("agenda_ur_rejeitada").select("*").execute().data
+    novas = [r for r in depois if r["id"] not in ids_antes]
+    assert len(novas) >= 1
+    for r in novas:
+        db.table("agenda_ur_rejeitada").delete().eq("id", r["id"]).execute()
