@@ -215,3 +215,45 @@ def processar_webhook_agenda(request):
 
     db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
     return JsonResponse({}, status=204)
+
+
+_TENANTS_JOBS_PERIODICOS = ["12345678000199"]  # lista fixa — design doc §14 ponto 3, não resolvido ainda
+_QUIET_PERIOD_SEGUNDOS = 90
+_HARD_TIMEOUT_SEGUNDOS = 15 * 60
+
+
+@require_POST
+def varrer_completude(request):
+    """Job de completude (SPEC03 §5.5): sem sinal de fim do webhook, uma
+    consulta ONLINE em PARCIAL vira COMPLETA após um quiet period sem
+    novas URs, ou COMPLETA_COM_TIMEOUT após um hard timeout desde o início.
+    Disparado por Cloud Scheduler, verificado pelo mesmo OIDC do consumidor
+    Pub/Sub (design doc §8/Global Constraints deste plano)."""
+    if not verificar_push_oidc(request):
+        return JsonResponse({"erro": "OIDC inválido"}, status=401)
+
+    agora = datetime.now(timezone.utc)
+    resultado = {"completas": 0, "timeout": 0}
+
+    for financiador_id in _TENANTS_JOBS_PERIODICOS:
+        db = get_db(financiador_id)
+        parciais = db.table("consulta_agenda").select("*").eq("status", "PARCIAL").execute().data
+
+        for consulta in parciais:
+            referencia = consulta["ultima_ur_em"] or consulta["iniciada_em"]
+            idade_desde_ultima_ur = (agora - referencia).total_seconds()
+            idade_total = (agora - consulta["iniciada_em"]).total_seconds()
+
+            if idade_total > _HARD_TIMEOUT_SEGUNDOS:
+                db.table("consulta_agenda").update({
+                    "status": "COMPLETA_COM_TIMEOUT", "encerrada_em": agora,
+                }).eq("id", consulta["id"]).execute()
+                logger.warning("[Completude] consulta %s COMPLETA_COM_TIMEOUT (financiador=%s)", consulta["id"], financiador_id)
+                resultado["timeout"] += 1
+            elif idade_desde_ultima_ur > _QUIET_PERIOD_SEGUNDOS:
+                db.table("consulta_agenda").update({
+                    "status": "COMPLETA", "encerrada_em": agora,
+                }).eq("id", consulta["id"]).execute()
+                resultado["completas"] += 1
+
+    return JsonResponse(resultado, status=200)
