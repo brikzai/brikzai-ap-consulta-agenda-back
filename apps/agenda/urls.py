@@ -4,4 +4,5 @@ from . import views
 urlpatterns = [
     path("health", views.health),
     re_path(r"^webhooks/agenda/(?P<financiador_id>\d{14})$", views.webhook_agenda),
+    path("webhooks/agenda/processar", views.processar_webhook_agenda),
 ]

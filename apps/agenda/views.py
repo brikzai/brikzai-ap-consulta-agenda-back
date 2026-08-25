@@ -2,16 +2,19 @@ import base64
 import hmac
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
+from apps.agenda.correlacao import encontrar_consultas_candidatas
+from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.webhook_dedupe import hash_evento
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
+from shared.pubsub_auth import verificar_push_oidc
 from shared.tenant_config import get_tenant_config
 
 logger = logging.getLogger(__name__)
@@ -107,3 +110,108 @@ def webhook_agenda(request, financiador_id: str):
         logger.exception("[Webhook] publish_webhook_agenda levantou inesperadamente (financiador=%s)", financiador_id)
 
     return JsonResponse({}, status=202)
+
+
+def _traduzir_pagamento_webhook(pagamento: dict) -> dict:
+    return {
+        "tipo_informacao_pagamento": str(pagamento["tipoInformacaoPagamento"]),
+        "indicador_efeitos_contrato": pagamento.get("indicadorEfeitosContrato"),
+        "identificador_cerc_contrato": None,  # coluna 12.16 — só o Plano 08 (arquivo AP005) preenche
+        "regras_divisao": pagamento.get("regrasDivisao"),
+        "valor_onerado": pagamento.get("valorOnerado"),
+        "valor_constituido_efeito": pagamento.get("valorConstituidoEfeito"),
+        "valor_a_pagar": pagamento.get("valorAPagar"),
+        "beneficiario": pagamento.get("beneficiario"),
+        "data_liquidacao_efetiva": pagamento.get("dataLiquidacaoEfetiva"),
+        "valor_liquidacao_efetiva": pagamento.get("valorLiquidacaoEfetiva"),
+        "motivo_nao_pagamento": pagamento.get("motivoDeNaoPagamento"),
+        "domicilio": pagamento.get("domicilioPagamento") or {},
+    }
+
+
+def _traduzir_evento_webhook(evento: dict) -> tuple:
+    cabecalho = {
+        "entidade_registradora": evento["entidadeRegistradora"],
+        "cnpj_credenciadora": evento["instituicaoCredenciadora"],
+        "codigo_arranjo": evento["codigoArranjoPagamento"],
+        "documento_ufr": evento["documentoUsuarioFinalRecebedor"],
+        "documento_titular": evento["documentoTitular"],
+        "data_liquidacao": evento["dataLiquidacao"],
+        "constituicao": evento["constituicao"],
+        "valor_constituido_total": evento["valorConstituidoTotal"],
+        "valor_constituido_antecipacao_pre": evento.get("valorConstituidoAntecipacaoPre", 0),
+        "valor_bloqueado": evento.get("valorBloqueado", 0),
+        "valor_livre": evento.get("valorLivre", 0),
+        "valor_total_ur": evento["valorTotalUR"],
+        "carteira": evento.get("carteira"),
+        "data_hora_ultima_atualizacao": datetime.fromisoformat(evento["dataHoraUltimaAtualizacao"].replace("Z", "+00:00")),
+        "origem": "WEBHOOK",
+        "origem_arquivo": None,
+    }
+    pagamentos = [_traduzir_pagamento_webhook(p) for p in evento.get("pagamentos", [])]
+    return cabecalho, pagamentos
+
+
+@require_POST
+def processar_webhook_agenda(request):
+    """Consumidor da push subscription do Pub/Sub — correlaciona a UR do
+    evento (SPEC03 §5.4) e persiste via upsert_agenda_ur (origem=WEBHOOK).
+    Verificado por OIDC. Idempotente sob reentrega (at-least-once): o guard
+    de webhook_inbox.processado_em evita refazer qualquer escrita."""
+    if not verificar_push_oidc(request):
+        return JsonResponse({"erro": "OIDC inválido"}, status=401)
+
+    try:
+        envelope = json.loads(request.body)
+        dados = json.loads(base64.b64decode(envelope["message"]["data"]))
+        webhook_inbox_id = dados["webhook_inbox_id"]
+        financiador_id = dados["financiador_id"]
+    except Exception:
+        logger.exception("[Processor] Envelope do Pub/Sub push malformado")
+        return JsonResponse({"erro": "envelope inválido"}, status=400)
+
+    db = get_db(financiador_id)
+    linhas_inbox = db.table("webhook_inbox").select("*").eq("id", webhook_inbox_id).execute()
+    if not linhas_inbox.data:
+        logger.error("[Processor] webhook_inbox_id=%s não encontrado (financiador=%s)", webhook_inbox_id, financiador_id)
+        return JsonResponse({"erro": "webhook_inbox não encontrado"}, status=404)
+    inbox = linhas_inbox.data[0]
+
+    if inbox["processado_em"] is not None:
+        return JsonResponse({}, status=204)
+
+    payload = inbox["payload"]
+    tipo_evento = payload.get("tipoEvento")
+    evento = payload.get("evento")
+
+    if tipo_evento != "agenda":
+        logger.warning("[Processor] tipoEvento=%s fora do escopo deste consumidor, ignorando", tipo_evento)
+        db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
+        return JsonResponse({}, status=204)
+
+    candidatas = encontrar_consultas_candidatas(financiador_id, evento)
+    cabecalho, pagamentos = _traduzir_evento_webhook(evento)
+
+    if not candidatas:
+        db.table("agenda_ur_orfa").insert({"payload": payload}).execute()
+    else:
+        upsert_agenda_ur(financiador_id, cabecalho, pagamentos)
+        agora = datetime.now(timezone.utc)
+        for consulta in candidatas:
+            db.table("consulta_agenda_ur").insert({
+                "consulta_id": consulta["id"],
+                "entidade_registradora": cabecalho["entidade_registradora"],
+                "cnpj_credenciadora": cabecalho["cnpj_credenciadora"],
+                "documento_ufr": cabecalho["documento_ufr"],
+                "documento_titular": cabecalho["documento_titular"],
+                "codigo_arranjo": cabecalho["codigo_arranjo"],
+                "data_liquidacao": cabecalho["data_liquidacao"],
+                "origem": "WEBHOOK",
+            }).execute()
+            db.table("consulta_agenda").update({
+                "qtd_urs_webhook": consulta["qtd_urs_webhook"] + 1,
+                "ultima_ur_em": agora,
+            }).eq("id", consulta["id"]).execute()
+
+    db.table("webhook_inbox").update({"processado_em": datetime.now(timezone.utc)}).eq("id", webhook_inbox_id).execute()
+    return JsonResponse({}, status=204)
