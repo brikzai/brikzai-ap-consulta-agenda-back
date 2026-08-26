@@ -1,5 +1,6 @@
 import base64
 import hmac
+import io
 import json
 import logging
 from datetime import datetime, timezone
@@ -9,7 +10,9 @@ from django.views.decorators.http import require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
+from apps.agenda import parser_ap005
 from apps.agenda.correlacao import encontrar_consultas_candidatas
+from apps.agenda.importar_ap005 import importar_arquivo
 from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.webhook_dedupe import hash_evento
 from shared import pubsub_client
@@ -283,3 +286,53 @@ def varrer_completude(request):
                 resultado["completas"] += 1
 
     return JsonResponse(resultado, status=200)
+
+
+class _StreamDeRequisicao(io.RawIOBase):
+    """Adapta o HttpRequest do Django (que só expõe .read(n)/.readline()) à
+    interface de leitura binária que io.TextIOWrapper exige (readable() +
+    readinto()) dentro de importar_arquivo — sem materializar o corpo da
+    requisição inteiro em memória, mantendo a leitura em stream (design doc
+    §9/§14 item 4, mesma restrição descrita na docstring de importar_ap005)."""
+
+    def __init__(self, request):
+        self._request = request
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        dados = self._request.read(len(buffer))
+        buffer[: len(dados)] = dados
+        return len(dados)
+
+
+@require_POST
+def importar_ap005(request, financiador_id: str):
+    """Endpoint interno de ingestão de arquivo AP005/AP005A/AP005B (design
+    doc §9/§14 item 4). A conexão real (SFTP/Bucket/Connect:Direct) é uma
+    dependência de infra ainda a definir — decisão do Plano 08 (Global
+    Constraints): por ora, o arquivo chega aqui já em mãos (nome no header
+    X-Nome-Arquivo, conteúdo no corpo bruto da requisição, lido via stream
+    — nunca request.body, que materializaria tudo em memória), protegido
+    pelo mesmo OIDC dos outros jobs internos. Um plano futuro liga isso a
+    Cloud Scheduler + o canal real, quando a credencial existir."""
+    if not verificar_push_oidc(request):
+        return JsonResponse({"erro": "OIDC inválido"}, status=401)
+
+    nome_arquivo = request.META.get("HTTP_X_NOME_ARQUIVO")
+    if not nome_arquivo:
+        return JsonResponse({"erro": "header X-Nome-Arquivo é obrigatório"}, status=400)
+
+    try:
+        resultado = importar_arquivo(financiador_id, nome_arquivo, _StreamDeRequisicao(request))
+    except parser_ap005.NomeArquivoInvalidoError as exc:
+        return JsonResponse({"erro": str(exc)}, status=400)
+    except Exception:
+        logger.exception(
+            "[ImportarAP005] Falha ao importar arquivo (financiador=%s, arquivo=%s)", financiador_id, nome_arquivo,
+        )
+        return JsonResponse({"erro": "falha ao importar arquivo"}, status=500)
+
+    status = 202 if resultado.get("ja_processado") else 200
+    return JsonResponse(resultado, status=status)
