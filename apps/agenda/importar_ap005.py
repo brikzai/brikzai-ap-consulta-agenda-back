@@ -1,9 +1,16 @@
 """Ingestão de arquivo AP005/AP005A/AP005B (design doc §9, SPEC03 §6.6).
 
 importar_arquivo(financiador_id, nome_arquivo, conteudo) é o ponto de
-entrada — conteudo é qualquer objeto binário com .read() (streaming,
-nunca materializa o arquivo inteiro em memória: SPEC03 §6.6). AP005A/AP005B
-chegam em .gzip (§6.5), descompactados por streaming via gzip.GzipFile.
+entrada — conteudo é um objeto binário lido em streaming, nunca
+materializado inteiro em memória (SPEC03 §6.6). Não basta um `.read()`
+solto: `_abrir_texto` empacota `conteudo` (ou o `gzip.GzipFile` em cima
+dele) num `io.TextIOWrapper`, que exige o protocolo de leitura binária
+completo (`readable()` retornando `True` e leitura via `readinto()`/
+`read(n)`, ao estilo `io.RawIOBase`) — ver `apps/agenda/views.py`,
+`_StreamDeRequisicao`, que implementa esse contrato para expor
+`request` (que só tem `.read(size)`) como um binário compatível.
+AP005A/AP005B chegam em .gzip (§6.5), descompactados por streaming via
+gzip.GzipFile.
 
 Idempotência por (tipo_leiaute, ident_ic, data_req, seq) — SPEC03 §6.6: se
 já existe uma linha em arquivo_agenda_processado (de QUALQUER tentativa
@@ -16,13 +23,32 @@ Agrupamento por UR: o arquivo real da CERC repete as colunas 1-11/13-16 a
 cada linha de pagamento da mesma UR (Plano 08, ver parser_ap005.py) — este
 módulo assume que essas linhas vêm CONSECUTIVAS no arquivo (a mesma chave
 não reaparece depois que outra chave começou) para poder agrupar em
-streaming, sem materializar o arquivo inteiro. Se o arquivo real não vier
-agrupado assim, cada grupo não-consecutivo é tratado como upsert
-independente e o mais recente apaga (via
-upsert_agenda_ur/_limpar_pagamentos_obsoletos) os pagamentos do grupo
-anterior que não repetir — mesma classe de gap best-effort do design doc
-§15 risco 1, carregado explicitamente aqui até haver um arquivo real para
-confirmar a ordenação (SPEC03 §13).
+streaming, sem materializar o arquivo inteiro. O loop principal NUNCA força
+um flush do grupo em andamento por causa de uma linha rejeitada
+(LinhaInvalidaError) ou do leiaute reduzido (resultado None) no meio das
+linhas de uma mesma UR — só uma mudança de chave (`_Agrupador.adicionar`)
+ou o fim do arquivo (`agrupador.finalizar()`, uma vez, após o loop) fecham
+um grupo; do contrário, uma linha rejeitada ou reduzida entre dois
+pagamentos da mesma UR cindiria o grupo em dois `upsert_agenda_ur`, e o
+segundo silenciosamente não gravaria nada (ver o parágrafo seguinte) —
+achado 1 da revisão final do Plano 08. Se o arquivo real não vier agrupado
+de forma consecutiva (mesma chave reaparecendo depois de outra ter
+começado), cada grupo não-consecutivo é tratado como upsert independente,
+e o resultado depende do timestamp: como `data_hora_ultima_atualizacao`
+(coluna 16) repete o MESMO valor em todas as linhas de uma UR dentro de um
+único arquivo, dois grupos não-consecutivos da mesma UR chegam a
+`upsert_agenda_ur` com timestamps IGUAIS — o desempate de
+`repository._deve_sobrescrever` (`precedencia_origem` só quebra o empate
+quando as origens diferem; aqui as duas chamadas são `origem="ARQUIVO"`)
+faz a SEGUNDA chamada retornar `sobrescrito=False` e não gravar nada: é o
+grupo mais TARDIO que se perde, não o mais antigo. Só quando o segundo
+grupo chega com um timestamp estritamente mais novo (ou origem de maior
+precedência) é que a chamada prossegue e `_limpar_pagamentos_obsoletos`
+remove os pagamentos do grupo anterior que o novo lote não repetir — esse
+caso (não o do timestamp empatado, que é o comum dentro de um mesmo
+arquivo) é a mesma classe de gap best-effort do design doc §15 risco 1,
+carregado explicitamente aqui até haver um arquivo real para confirmar a
+ordenação (SPEC03 §13).
 """
 import csv
 import gzip
@@ -135,13 +161,22 @@ def importar_arquivo(financiador_id: str, nome_arquivo: str, conteudo) -> dict:
         try:
             resultado = parser_ap005.traduzir_linha(campos, meta["tipo_leiaute"])
         except parser_ap005.LinhaInvalidaError as exc:
-            agrupador.finalizar()
             _registrar_rejeitada(db, nome_arquivo, numero_linha, campos, str(exc))
             linhas_rejeitadas_parser += 1
             continue
 
         if resultado is None:
-            agrupador.finalizar()
+            if len(campos) >= 3:
+                # SPEC03 §6.2: o leiaute reduzido "sem agenda" carrega uma
+                # lista de erros (código + descrição) quando a CERC reportou
+                # erro para essa linha — o parser não expõe esses campos
+                # (contrato de retorno não muda, Finding 3 da revisão final
+                # do Plano 08), então isso é só um log de observabilidade;
+                # a linha continua contando como OK, nunca rejeitada.
+                logger.warning(
+                    "[ImportarAP005] Linha em leiaute reduzido com possível lista de erros da CERC (arquivo=%s, linha=%d, conteudo=%s)",
+                    nome_arquivo, numero_linha, ",".join(campos),
+                )
             linhas_sem_agenda += 1
             continue
 

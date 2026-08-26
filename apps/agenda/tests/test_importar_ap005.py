@@ -108,6 +108,30 @@ def test_agrupa_linhas_consecutivas_da_mesma_ur_num_unico_upsert():
     assert {p["tipo_informacao_pagamento"] for p in pagamentos} == {"6", "1"}
 
 
+def test_linha_invalida_no_meio_do_grupo_nao_quebra_upsert_da_ur():
+    """Regressão (Plano 08, revisão final, achado 1): uma linha rejeitada
+    NO MEIO das linhas de pagamento consecutivas da MESMA UR não pode
+    quebrar o grupo em dois upserts — o segundo silenciosamente não
+    grava nada (mesma data_hora_ultima_atualizacao, tie-break de origem
+    igual em repository._deve_sobrescrever), perdendo o pagamento da
+    linha válida que vem depois da rejeitada."""
+    linhas = [
+        _linha(tipo_informacao_pagamento="6", identificador="CTR-1"),
+        _linha(tipo_informacao_pagamento="9", identificador="CTR-INVALIDA"),  # tipoInformacaoPagamento fora do domínio 1-8
+        _linha(tipo_informacao_pagamento="1", identificador="CTR-2"),
+    ]
+    conteudo = io.BytesIO(_csv_bytes(linhas))
+    resultado = importar_ap005.importar_arquivo(FINANCIADOR_TESTE, NOME_ARQUIVO, conteudo)
+
+    assert resultado["linhas_lidas"] == 3
+    assert resultado["linhas_rejeitadas"] == 1
+    assert resultado["linhas_ok"] == 2
+
+    db = get_db(FINANCIADOR_TESTE)
+    pagamentos = _com_filtros(db.table("agenda_ur_pagamento").select("*"), _CHAVE_TESTE, _CHAVE_UR).execute().data
+    assert {p["tipo_informacao_pagamento"] for p in pagamentos} == {"6", "1"}
+
+
 def test_idempotente_segunda_chamada_nao_reprocessa():
     conteudo1 = io.BytesIO(_csv_bytes([_linha()]))
     importar_ap005.importar_arquivo(FINANCIADOR_TESTE, NOME_ARQUIVO, conteudo1)
