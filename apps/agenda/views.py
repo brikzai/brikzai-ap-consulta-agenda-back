@@ -13,7 +13,7 @@ from ulid import ULID
 from apps.agenda import parser_ap005
 from apps.agenda.correlacao import encontrar_consultas_candidatas
 from apps.agenda.importar_ap005 import importar_arquivo
-from apps.agenda.repository import _CHAVE_UR, _buscar_um
+from apps.agenda.repository import _CHAVE_UR, _buscar_um, _como_datetime
 from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.validation import ValidacaoConsultaError
 from apps.agenda.webhook_dedupe import hash_evento
@@ -463,7 +463,7 @@ def _contagem_e_frescor_por_origem(db, consulta_id: str) -> tuple:
         chave = {campo: vinculo[campo] for campo in _CHAVE_UR}
         ur = _buscar_um(db, "agenda_ur", chave, _CHAVE_UR)
         if ur:
-            timestamps.append(ur["data_hora_ultima_atualizacao"])
+            timestamps.append(_como_datetime(ur["data_hora_ultima_atualizacao"]))
 
     frescor = None
     if timestamps:
