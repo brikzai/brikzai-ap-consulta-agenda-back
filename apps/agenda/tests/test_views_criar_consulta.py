@@ -122,6 +122,26 @@ def test_modo_invalido_retorna_400(keypair):
     assert response.json()["erro"] == "MODO_INVALIDO"
 
 
+def test_base_autorizativa_nao_dict_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().post(
+        URL, data=json.dumps(_corpo_consulta(baseAutorizativa="OPTIN")), content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "DATA_INVALIDA"
+
+
+def test_data_inicio_nao_string_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().post(
+        URL, data=json.dumps(_corpo_consulta(dataInicio=20260901)), content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "DATA_INVALIDA"
+
+
 def test_politica_nao_configurada_retorna_403(keypair):
     private_pem, _ = keypair
     response = Client().post(

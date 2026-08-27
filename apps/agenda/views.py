@@ -420,7 +420,10 @@ def criar_consulta_agenda(request):
 
     try:
         consulta = _traduzir_requisicao_consulta(payload, request)
-    except ValueError as exc:
+    except (ValueError, TypeError, AttributeError) as exc:
+        # TypeError/AttributeError cobrem formatos inesperados nos campos
+        # (ex.: dataInicio não-string, baseAutorizativa não-dict) — são erro
+        # do cliente (400), não falha inesperada (500).
         return JsonResponse({"erro": "DATA_INVALIDA", "mensagem": str(exc)}, status=400)
 
     try:
