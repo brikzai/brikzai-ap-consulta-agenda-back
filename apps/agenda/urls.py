@@ -11,4 +11,5 @@ urlpatterns = [
     re_path(r"^agendas/consultas/(?P<consulta_id>[0-9A-Za-z]{26})$", views.obter_consulta_agenda),
     path("config/politicas-consulta", views.politicas_consulta),
     path("agendas/urs", views.listar_urs),
+    path("agendas/urs/posicao", views.posicao_urs),
 ]

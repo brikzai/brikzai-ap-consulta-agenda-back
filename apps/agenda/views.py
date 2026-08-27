@@ -704,3 +704,102 @@ def listar_urs(request):
     except Exception:
         logger.exception("[AgendasUrs] Falha inesperada ao listar (financiador=%s)", request.financiador_id)
         return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao listar URs"}, status=500)
+
+
+_CAMPOS_OBRIGATORIOS_POSICAO = ("ufr", "dataLiquidacaoInicio", "dataLiquidacaoFim")
+
+
+def _aplicar_filtros_posicao(query, request):
+    query = query.eq("documento_ufr", request.GET["ufr"])
+    query = query.gte("data_liquidacao", request.GET["dataLiquidacaoInicio"])
+    query = query.lte("data_liquidacao", request.GET["dataLiquidacaoFim"])
+    credenciadora = request.GET.get("credenciadora")
+    arranjo = request.GET.get("arranjo")
+    if credenciadora:
+        query = query.eq("cnpj_credenciadora", credenciadora)
+    if arranjo:
+        query = query.eq("codigo_arranjo", arranjo)
+    return query
+
+
+@jwt_required
+@require_GET
+def posicao_urs(request):
+    """GET /api/v1/agendas/urs/posicao (design doc §10, SPEC03 §7.4) —
+    visão agregada de crédito por UFR/janela. valorFumaca (constituicao=2)
+    é sempre segregado: nunca soma em valorTotalConstituido/porCredenciadora
+    /porArranjo/valorOnerado (Global Constraints deste plano). Sem JOIN:
+    valorOnerado roda como query separada sobre agenda_ur_pagamento com os
+    mesmos filtros de coluna compartilhados."""
+    faltando = [c for c in _CAMPOS_OBRIGATORIOS_POSICAO if not request.GET.get(c)]
+    if faltando:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": f"parâmetros obrigatórios ausentes: {', '.join(faltando)}"},
+            status=400,
+        )
+
+    try:
+        db = get_db(request.financiador_id)
+
+        por_constituicao = _aplicar_filtros_posicao(
+            db.table("agenda_ur").select(
+                "constituicao, COALESCE(SUM(valor_constituido_total),0) AS total, "
+                "COALESCE(SUM(valor_bloqueado),0) AS bloqueado, COALESCE(SUM(valor_livre),0) AS livre"
+            ),
+            request,
+        ).group_by("constituicao").execute().data
+        totais = {linha["constituicao"]: linha for linha in por_constituicao}
+        constituido = totais.get("1", {"total": 0, "bloqueado": 0, "livre": 0})
+        fumaca = totais.get("2", {"total": 0})
+
+        por_credenciadora = _aplicar_filtros_posicao(
+            db.table("agenda_ur").select(
+                "cnpj_credenciadora, COALESCE(SUM(valor_constituido_total),0) AS total"
+            ).eq("constituicao", "1"),
+            request,
+        ).group_by("cnpj_credenciadora").execute().data
+
+        por_arranjo = _aplicar_filtros_posicao(
+            db.table("agenda_ur").select(
+                "codigo_arranjo, COALESCE(SUM(valor_constituido_total),0) AS total"
+            ).eq("constituicao", "1"),
+            request,
+        ).group_by("codigo_arranjo").execute().data
+
+        onerado = _aplicar_filtros_posicao(
+            db.table("agenda_ur_pagamento").select("COALESCE(SUM(valor_onerado),0) AS total"), request,
+        ).execute().data
+        valor_onerado = onerado[0]["total"]
+
+        frescor_linhas = _aplicar_filtros_posicao(
+            db.table("agenda_ur").select(
+                "MIN(data_hora_ultima_atualizacao) AS mais_antigo, MAX(data_hora_ultima_atualizacao) AS mais_recente"
+            ),
+            request,
+        ).execute().data
+        frescor = None
+        if frescor_linhas and frescor_linhas[0]["mais_antigo"] is not None:
+            frescor = {
+                "maisAntigo": _como_datetime(frescor_linhas[0]["mais_antigo"]).isoformat(),
+                "maisRecente": _como_datetime(frescor_linhas[0]["mais_recente"]).isoformat(),
+            }
+
+        return JsonResponse({
+            "valorTotalConstituido": constituido["total"],
+            "valorLivre": constituido["livre"],
+            "valorBloqueado": constituido["bloqueado"],
+            "valorOnerado": valor_onerado,
+            "valorFumaca": fumaca["total"],
+            "porCredenciadora": [
+                {"cnpjCredenciadora": l["cnpj_credenciadora"], "valorTotalConstituido": l["total"]}
+                for l in por_credenciadora
+            ],
+            "porArranjo": [
+                {"codigoArranjo": l["codigo_arranjo"], "valorTotalConstituido": l["total"]}
+                for l in por_arranjo
+            ],
+            "frescor": frescor,
+        }, status=200)
+    except Exception:
+        logger.exception("[AgendasUrsPosicao] Falha inesperada (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao calcular posição"}, status=500)
