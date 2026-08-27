@@ -9,4 +9,5 @@ urlpatterns = [
     re_path(r"^jobs/importar-ap005/(?P<financiador_id>\d{14})$", views.importar_ap005),
     path("agendas/consultas", views.criar_consulta_agenda),
     re_path(r"^agendas/consultas/(?P<consulta_id>[0-9A-Za-z]{26})$", views.obter_consulta_agenda),
+    path("config/politicas-consulta", views.politicas_consulta),
 ]

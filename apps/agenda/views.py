@@ -6,7 +6,7 @@ import logging
 from datetime import date, datetime, timezone
 
 from django.http import JsonResponse
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
@@ -15,7 +15,7 @@ from apps.agenda.correlacao import encontrar_consultas_candidatas
 from apps.agenda.importar_ap005 import importar_arquivo
 from apps.agenda.repository import _CHAVE_UR, _buscar_um, _como_datetime
 from apps.agenda.repository import upsert_agenda_ur
-from apps.agenda.validation import ValidacaoConsultaError
+from apps.agenda.validation import ValidacaoConsultaError, validar_modos_permitidos
 from apps.agenda.webhook_dedupe import hash_evento
 from services.cerc.client import (
     CercConsultaCriticaError,
@@ -502,3 +502,85 @@ def obter_consulta_agenda(request, consulta_id: str):
 
     contagem, frescor = _contagem_e_frescor_por_origem(db, consulta_id)
     return JsonResponse(_serializar_consulta(linhas[0], contagem, frescor), status=200)
+
+
+def _serializar_politica(politica: dict) -> dict:
+    return {
+        "id": politica["id"],
+        "motivo": politica["motivo"],
+        "modosPermitidos": politica["modos_permitidos"],
+        "ativo": politica["ativo"],
+        "criadoEm": politica["criado_em"].isoformat(),
+        "atualizadoEm": politica["atualizado_em"].isoformat(),
+    }
+
+
+def _listar_politicas(request):
+    db = get_db(request.financiador_id)
+    politicas = db.table("politica_consulta").select("*").execute().data
+    return JsonResponse({"politicas": [_serializar_politica(p) for p in politicas]}, status=200)
+
+
+def _upsert_politica(request):
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"erro": "CORPO_INVALIDO", "mensagem": "corpo não é JSON válido"}, status=400)
+
+    motivo = payload.get("motivo")
+    if not motivo:
+        return JsonResponse({"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": "motivo é obrigatório"}, status=400)
+
+    try:
+        validar_modos_permitidos(payload.get("modosPermitidos"))
+    except ValidacaoConsultaError as exc:
+        return JsonResponse({"erro": exc.codigo, "mensagem": exc.mensagem}, status=400)
+
+    ativo = payload.get("ativo", True)
+    db = get_db(request.financiador_id)
+    dados = {
+        "modos_permitidos": payload["modosPermitidos"], "ativo": ativo,
+        "atualizado_em": datetime.now(timezone.utc),
+    }
+    existente = db.table("politica_consulta").select("id").eq("motivo", motivo).execute().data
+    if existente:
+        politica = db.table("politica_consulta").update(dados).eq("motivo", motivo).execute().data[0]
+    else:
+        politica = db.table("politica_consulta").insert({"id": str(ULID()), "motivo": motivo, **dados}).execute().data[0]
+
+    return JsonResponse(_serializar_politica(politica), status=200)
+
+
+def _desativar_politica(request):
+    motivo = request.GET.get("motivo")
+    if not motivo:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": "motivo é obrigatório (query string)"}, status=400,
+        )
+
+    db = get_db(request.financiador_id)
+    existente = db.table("politica_consulta").select("*").eq("motivo", motivo).execute().data
+    if not existente:
+        return JsonResponse(
+            {"erro": "POLITICA_NAO_ENCONTRADA", "mensagem": f"nenhuma política para o motivo {motivo!r}"}, status=404,
+        )
+
+    politica = db.table("politica_consulta").update({
+        "ativo": False, "atualizado_em": datetime.now(timezone.utc),
+    }).eq("motivo", motivo).execute().data[0]
+    return JsonResponse(_serializar_politica(politica), status=200)
+
+
+@jwt_required
+@require_http_methods(["GET", "PUT", "DELETE"])
+def politicas_consulta(request):
+    """GET/PUT/DELETE /api/v1/config/politicas-consulta (design doc §7)
+    — self-service: cada financiador só vê/edita a própria política,
+    automático porque cada um tem seu próprio banco (nenhuma checagem de
+    propriedade extra é necessária). DELETE nunca apaga a linha — só
+    desativa (Global Constraints deste plano)."""
+    if request.method == "GET":
+        return _listar_politicas(request)
+    if request.method == "PUT":
+        return _upsert_politica(request)
+    return _desativar_politica(request)

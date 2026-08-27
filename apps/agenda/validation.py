@@ -174,6 +174,22 @@ def validar_politica_consulta(financiador_id: str, motivo: str, modo: str) -> No
         )
 
 
+_MODOS_VALIDOS = {"BATCH", "ONLINE"}
+
+
+def validar_modos_permitidos(modos_permitidos) -> None:
+    """Valida modos_permitidos <@ ARRAY['BATCH','ONLINE'] (design doc §7)
+    — checagem de aplicação, não CHECK de banco (mesmo estilo dos irmãos:
+    domínio muda por decisão de produto, não regra imutável do banco)."""
+    if not modos_permitidos:
+        raise ValidacaoConsultaError("MODOS_PERMITIDOS_VAZIO", "modosPermitidos não pode ser vazio")
+    invalidos = [m for m in modos_permitidos if m not in _MODOS_VALIDOS]
+    if invalidos:
+        raise ValidacaoConsultaError(
+            "MODOS_PERMITIDOS_INVALIDO", f"modosPermitidos contém valor(es) inválido(s): {', '.join(invalidos)}",
+        )
+
+
 def validar_consulta(financiador_id: str, consulta: dict) -> None:
     """Roda A01-A10 na ordem do design doc, antes de qualquer chamada à CERC."""
     validar_documento(
