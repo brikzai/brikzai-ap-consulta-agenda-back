@@ -3,7 +3,7 @@ import hmac
 import io
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
@@ -14,9 +14,17 @@ from apps.agenda import parser_ap005
 from apps.agenda.correlacao import encontrar_consultas_candidatas
 from apps.agenda.importar_ap005 import importar_arquivo
 from apps.agenda.repository import upsert_agenda_ur
+from apps.agenda.validation import ValidacaoConsultaError
 from apps.agenda.webhook_dedupe import hash_evento
+from services.cerc.client import (
+    CercConsultaCriticaError,
+    CercConsultaInvalidaError,
+    CercConsultaRetentavelError,
+    consultar_agenda,
+)
 from shared import pubsub_client
 from shared.cloudsql_client import get_db
+from shared.jwt_auth import jwt_required
 from shared.pubsub_auth import verificar_push_oidc
 from shared.tenant_config import get_tenant_config
 
@@ -336,3 +344,102 @@ def importar_ap005(request, financiador_id: str):
 
     status = 202 if resultado.get("ja_processado") else 200
     return JsonResponse(resultado, status=status)
+
+
+_CODIGOS_VALIDACAO_403 = {
+    "SEM_BASE_AUTORIZATIVA", "POLITICA_NAO_CONFIGURADA", "MODO_NAO_PERMITIDO",
+    "RATE_LIMIT_EXCEDIDO", "CARTEIRA_OBRIGATORIA",
+}
+
+
+def _status_para_validacao(codigo: str) -> int:
+    return 403 if codigo in _CODIGOS_VALIDACAO_403 else 422
+
+
+def _parse_data_iso(valor, nome: str) -> date:
+    if not valor:
+        raise ValueError(f"{nome} é obrigatório")
+    try:
+        return date.fromisoformat(valor)
+    except ValueError:
+        raise ValueError(f"{nome} deve estar no formato AAAA-MM-DD: {valor!r}")
+
+
+def _traduzir_requisicao_consulta(payload: dict, request) -> dict:
+    base_autorizativa = payload.get("baseAutorizativa") or {}
+    return {
+        "modo": payload.get("modo"),
+        "documento_ufr": payload.get("usuarioFinalRecebedor"),
+        "documento_titular": payload.get("titular"),
+        "credenciadoras": payload.get("credenciadoras") or [],
+        "arranjos": payload.get("arranjos") or [],
+        "data_inicio": _parse_data_iso(payload.get("dataInicio"), "dataInicio"),
+        "data_fim": _parse_data_iso(payload.get("dataFim"), "dataFim"),
+        "tipo_avaliacao": payload.get("tipoAvaliacao"),
+        "participante": payload.get("participante"),
+        "carteira": payload.get("carteira"),
+        "base_autorizativa": {"tipo": base_autorizativa.get("tipo"), "id": base_autorizativa.get("id")},
+        "motivo": payload.get("motivo"),
+        "ator": request.jwt_claims.get("sub") or "desconhecido",
+        "origem_ip": request.META.get("REMOTE_ADDR"),
+    }
+
+
+_CAMPOS_OBRIGATORIOS_CONSULTA = (
+    "modo", "usuarioFinalRecebedor", "credenciadoras", "arranjos",
+    "dataInicio", "dataFim", "baseAutorizativa", "motivo",
+)
+
+
+@jwt_required
+@require_POST
+def criar_consulta_agenda(request):
+    """POST /api/v1/agendas/consultas (design doc §10, SPEC03 §7.1) —
+    wrapper fino em cima de services.cerc.client.consultar_agenda (Plano
+    06), que já roda A01-A10 e faz a chamada à CERC. Esta view só traduz
+    o payload camelCase pro dict snake_case que consultar_agenda espera,
+    mapeia exceções pra status HTTP (Global Constraints deste plano), e
+    preenche ator/origem_ip a partir do JWT — nunca do corpo."""
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"erro": "CORPO_INVALIDO", "mensagem": "corpo não é JSON válido"}, status=400)
+
+    if not isinstance(payload, dict):
+        return JsonResponse({"erro": "CORPO_INVALIDO", "mensagem": "corpo deve ser um objeto JSON"}, status=400)
+
+    faltando = [campo for campo in _CAMPOS_OBRIGATORIOS_CONSULTA if not payload.get(campo)]
+    if faltando:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": f"campos obrigatórios ausentes: {', '.join(faltando)}"},
+            status=400,
+        )
+
+    if payload["modo"] not in ("ONLINE", "BATCH"):
+        return JsonResponse({"erro": "MODO_INVALIDO", "mensagem": "modo deve ser ONLINE ou BATCH"}, status=400)
+
+    try:
+        consulta = _traduzir_requisicao_consulta(payload, request)
+    except ValueError as exc:
+        return JsonResponse({"erro": "DATA_INVALIDA", "mensagem": str(exc)}, status=400)
+
+    try:
+        resultado = consultar_agenda(request.financiador_id, consulta)
+    except ValidacaoConsultaError as exc:
+        return JsonResponse({"erro": exc.codigo, "mensagem": exc.mensagem}, status=_status_para_validacao(exc.codigo))
+    except CercConsultaCriticaError as exc:
+        logger.error("[Consultas] Erro crítico da CERC (financiador=%s): %s", request.financiador_id, exc)
+        return JsonResponse({"erro": exc.codigo, "mensagem": exc.mensagem}, status=502)
+    except CercConsultaRetentavelError as exc:
+        return JsonResponse({"erro": exc.codigo, "mensagem": exc.mensagem}, status=503)
+    except CercConsultaInvalidaError as exc:
+        return JsonResponse({"erro": exc.codigo, "mensagem": exc.mensagem}, status=422)
+    except Exception:
+        logger.exception("[Consultas] Falha inesperada ao criar consulta (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao processar a consulta"}, status=500)
+
+    status_http = 200 if consulta["modo"] == "BATCH" else 202
+    return JsonResponse(
+        {"consultaId": resultado["consultaId"], "status": resultado["status"], "agendas": resultado["agendas"]},
+        status=status_http,
+    )

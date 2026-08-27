@@ -7,4 +7,5 @@ urlpatterns = [
     path("webhooks/agenda/processar", views.processar_webhook_agenda),
     path("jobs/varrer-completude", views.varrer_completude),
     re_path(r"^jobs/importar-ap005/(?P<financiador_id>\d{14})$", views.importar_ap005),
+    path("agendas/consultas", views.criar_consulta_agenda),
 ]
