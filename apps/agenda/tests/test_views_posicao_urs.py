@@ -137,3 +137,10 @@ def test_sem_urs_no_periodo_retorna_zeros_e_frescor_none(keypair):
     assert corpo["porCredenciadora"] == []
     assert corpo["porArranjo"] == []
     assert corpo["frescor"] is None
+    # Os defaults quando não há linha na agregação precisam ser Decimal, não
+    # int puro — senão o JSON emite número em vez de string (inconsistência
+    # de tipo com o caso em que há dados, ver DjangoJSONEncoder/Decimal).
+    assert isinstance(corpo["valorTotalConstituido"], str)
+    assert isinstance(corpo["valorBloqueado"], str)
+    assert isinstance(corpo["valorLivre"], str)
+    assert isinstance(corpo["valorFumaca"], str)

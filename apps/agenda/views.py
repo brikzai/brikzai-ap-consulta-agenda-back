@@ -4,6 +4,7 @@ import io
 import json
 import logging
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
@@ -751,8 +752,8 @@ def posicao_urs(request):
             request,
         ).group_by("constituicao").execute().data
         totais = {linha["constituicao"]: linha for linha in por_constituicao}
-        constituido = totais.get("1", {"total": 0, "bloqueado": 0, "livre": 0})
-        fumaca = totais.get("2", {"total": 0})
+        constituido = totais.get("1", {"total": Decimal("0"), "bloqueado": Decimal("0"), "livre": Decimal("0")})
+        fumaca = totais.get("2", {"total": Decimal("0")})
 
         por_credenciadora = _aplicar_filtros_posicao(
             db.table("agenda_ur").select(
