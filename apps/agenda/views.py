@@ -678,6 +678,12 @@ def listar_urs(request):
         cursor_bruto = request.GET.get("cursor")
         cursor = int(cursor_bruto) if cursor_bruto else None
         limite = _parse_limite(request)
+        data_liq_inicio_bruto = request.GET.get("dataLiquidacaoInicio")
+        data_liq_fim_bruto = request.GET.get("dataLiquidacaoFim")
+        atualizado_desde_bruto = request.GET.get("atualizadoDesde")
+        data_liq_inicio = _parse_data_iso(data_liq_inicio_bruto, "dataLiquidacaoInicio") if data_liq_inicio_bruto else None
+        data_liq_fim = _parse_data_iso(data_liq_fim_bruto, "dataLiquidacaoFim") if data_liq_fim_bruto else None
+        atualizado_desde = datetime.fromisoformat(atualizado_desde_bruto) if atualizado_desde_bruto else None
     except ValueError as exc:
         return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
 
@@ -689,14 +695,11 @@ def listar_urs(request):
             if valor:
                 query = query.eq(coluna, valor)
 
-        data_inicio = request.GET.get("dataLiquidacaoInicio")
-        data_fim = request.GET.get("dataLiquidacaoFim")
-        atualizado_desde = request.GET.get("atualizadoDesde")
-        if data_inicio:
-            query = query.gte("data_liquidacao", data_inicio)
-        if data_fim:
-            query = query.lte("data_liquidacao", data_fim)
-        if atualizado_desde:
+        if data_liq_inicio is not None:
+            query = query.gte("data_liquidacao", data_liq_inicio)
+        if data_liq_fim is not None:
+            query = query.lte("data_liquidacao", data_liq_fim)
+        if atualizado_desde is not None:
             query = query.gte("atualizado_em", atualizado_desde)
 
         pagina, proximo_cursor = _pagina_com_cursor(query, "sequencia", cursor, limite)
@@ -711,10 +714,10 @@ def listar_urs(request):
 _CAMPOS_OBRIGATORIOS_POSICAO = ("ufr", "dataLiquidacaoInicio", "dataLiquidacaoFim")
 
 
-def _aplicar_filtros_posicao(query, request):
+def _aplicar_filtros_posicao(query, request, data_liq_inicio: date, data_liq_fim: date):
     query = query.eq("documento_ufr", request.GET["ufr"])
-    query = query.gte("data_liquidacao", request.GET["dataLiquidacaoInicio"])
-    query = query.lte("data_liquidacao", request.GET["dataLiquidacaoFim"])
+    query = query.gte("data_liquidacao", data_liq_inicio)
+    query = query.lte("data_liquidacao", data_liq_fim)
     credenciadora = request.GET.get("credenciadora")
     arranjo = request.GET.get("arranjo")
     if credenciadora:
@@ -742,6 +745,12 @@ def posicao_urs(request):
         )
 
     try:
+        data_liq_inicio = _parse_data_iso(request.GET.get("dataLiquidacaoInicio"), "dataLiquidacaoInicio")
+        data_liq_fim = _parse_data_iso(request.GET.get("dataLiquidacaoFim"), "dataLiquidacaoFim")
+    except ValueError as exc:
+        return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
+
+    try:
         db = get_db(request.financiador_id)
 
         por_constituicao = _aplicar_filtros_posicao(
@@ -749,7 +758,7 @@ def posicao_urs(request):
                 "constituicao, COALESCE(SUM(valor_constituido_total),0) AS total, "
                 "COALESCE(SUM(valor_bloqueado),0) AS bloqueado, COALESCE(SUM(valor_livre),0) AS livre"
             ),
-            request,
+            request, data_liq_inicio, data_liq_fim,
         ).group_by("constituicao").execute().data
         totais = {linha["constituicao"]: linha for linha in por_constituicao}
         constituido = totais.get("1", {"total": Decimal("0"), "bloqueado": Decimal("0"), "livre": Decimal("0")})
@@ -759,14 +768,14 @@ def posicao_urs(request):
             db.table("agenda_ur").select(
                 "cnpj_credenciadora, COALESCE(SUM(valor_constituido_total),0) AS total"
             ).eq("constituicao", "1"),
-            request,
+            request, data_liq_inicio, data_liq_fim,
         ).group_by("cnpj_credenciadora").execute().data
 
         por_arranjo = _aplicar_filtros_posicao(
             db.table("agenda_ur").select(
                 "codigo_arranjo, COALESCE(SUM(valor_constituido_total),0) AS total"
             ).eq("constituicao", "1"),
-            request,
+            request, data_liq_inicio, data_liq_fim,
         ).group_by("codigo_arranjo").execute().data
 
         # valorOnerado não filtra por constituicao='1' porque agenda_ur_pagamento
@@ -777,7 +786,8 @@ def posicao_urs(request):
         # — representam uma expectativa futura, não uma UR real ainda. Reavaliar
         # junto do risco 20 (design doc) quando um filtro IN for construído.
         onerado = _aplicar_filtros_posicao(
-            db.table("agenda_ur_pagamento").select("COALESCE(SUM(valor_onerado),0) AS total"), request,
+            db.table("agenda_ur_pagamento").select("COALESCE(SUM(valor_onerado),0) AS total"),
+            request, data_liq_inicio, data_liq_fim,
         ).execute().data
         valor_onerado = onerado[0]["total"]
 
@@ -785,7 +795,7 @@ def posicao_urs(request):
             db.table("agenda_ur").select(
                 "MIN(data_hora_ultima_atualizacao) AS mais_antigo, MAX(data_hora_ultima_atualizacao) AS mais_recente"
             ),
-            request,
+            request, data_liq_inicio, data_liq_fim,
         ).execute().data
         frescor = None
         if frescor_linhas and frescor_linhas[0]["mais_antigo"] is not None:

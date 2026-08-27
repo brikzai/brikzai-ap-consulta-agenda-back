@@ -144,3 +144,13 @@ def test_sem_urs_no_periodo_retorna_zeros_e_frescor_none(keypair):
     assert isinstance(corpo["valorBloqueado"], str)
     assert isinstance(corpo["valorLivre"], str)
     assert isinstance(corpo["valorFumaca"], str)
+
+
+def test_data_liquidacao_invalida_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().get(
+        f"{URL}?ufr={UFR_TESTE}&dataLiquidacaoInicio=ontem&dataLiquidacaoFim=2026-09-30",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "PARAMETRO_INVALIDO"

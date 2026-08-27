@@ -135,6 +135,26 @@ def test_filtro_data_liquidacao_intervalo_restringe_resultado(keypair):
     assert {ur["codigoArranjo"] for ur in corpo["urs"]} == {"VCC"}
 
 
+def test_data_liquidacao_inicio_invalida_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().get(
+        f"{URL}?ufr={UFR_TESTE}&dataLiquidacaoInicio=ontem",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "PARAMETRO_INVALIDO"
+
+
+def test_atualizado_desde_invalido_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().get(
+        f"{URL}?ufr={UFR_TESTE}&atualizadoDesde=ontem",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "PARAMETRO_INVALIDO"
+
+
 def test_filtro_atualizado_desde_exclui_registro_mais_antigo(keypair):
     private_pem, _ = keypair
     db = get_db(FINANCIADOR_TESTE)
