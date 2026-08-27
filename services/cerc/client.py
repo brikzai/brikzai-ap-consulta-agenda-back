@@ -218,6 +218,19 @@ def _registrar_ur_rejeitada(financiador_id: str, ur_bruta: dict, erro: Exception
     }).execute()
 
 
+def _vincular_consulta_ur(financiador_id: str, consulta_id: str, cabecalho: dict) -> None:
+    get_db(financiador_id).table("consulta_agenda_ur").insert({
+        "consulta_id": consulta_id,
+        "entidade_registradora": cabecalho["entidade_registradora"],
+        "cnpj_credenciadora": cabecalho["cnpj_credenciadora"],
+        "documento_ufr": cabecalho["documento_ufr"],
+        "documento_titular": cabecalho["documento_titular"],
+        "codigo_arranjo": cabecalho["codigo_arranjo"],
+        "data_liquidacao": cabecalho["data_liquidacao"],
+        "origem": "SINCRONO",
+    }).execute()
+
+
 def _criar_consulta_agenda(financiador_id: str, consulta: dict) -> str:
     dados = {
         "id": str(ULID()),
@@ -276,6 +289,7 @@ def consultar_agenda(financiador_id: str, consulta: dict) -> dict:
                 linhas = _traduzir_ur(agenda, ur)
                 for cabecalho, pagamentos in linhas:
                     upsert_agenda_ur(financiador_id, cabecalho, pagamentos)
+                    _vincular_consulta_ur(financiador_id, consulta_id, cabecalho)  # fecha risco 14
                     qtd_urs += 1
             except Exception as exc:
                 _registrar_ur_rejeitada(financiador_id, ur, exc)

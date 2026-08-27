@@ -30,6 +30,7 @@ def _limpar():
     db = get_db(FINANCIADOR_TESTE)
     parcial = {"data_liquidacao": CHAVE_UR_TESTE["data_liquidacao"], "entidade_registradora": CHAVE_UR_TESTE["entidade_registradora"]}
     campos_parciais = ("data_liquidacao", "entidade_registradora")
+    repository._com_filtros(db.table("consulta_agenda_ur").delete(), parcial, campos_parciais).execute()
     repository._com_filtros(db.table("agenda_ur_evento").delete(), parcial, campos_parciais).execute()
     repository._com_filtros(db.table("agenda_ur_pagamento").delete(), parcial, campos_parciais).execute()
     repository._com_filtros(db.table("agenda_ur").delete(), parcial, campos_parciais).execute()
@@ -497,3 +498,17 @@ def test_consultar_agenda_fecha_consulta_em_erro_quando_token_falha(monkeypatch)
     assert len(consultas) == 1
     assert consultas[0]["status"] == "ERRO"
     assert consultas[0]["encerrada_em"] is not None
+
+
+@respx.mock
+def test_consultar_agenda_vincula_ur_em_consulta_agenda_ur_com_origem_sincrono():
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
+
+    resultado = client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base())
+
+    db = get_db(FINANCIADOR_TESTE)
+    vinculos = db.table("consulta_agenda_ur").select("*").eq("consulta_id", resultado["consultaId"]).execute().data
+    assert len(vinculos) == 1
+    assert vinculos[0]["origem"] == "SINCRONO"
+    assert vinculos[0]["entidade_registradora"] == "22246686000196"
+    assert vinculos[0]["documento_titular"] == CNPJ_VALIDO
