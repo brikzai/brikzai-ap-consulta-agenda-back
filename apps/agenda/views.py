@@ -493,15 +493,22 @@ def _serializar_consulta(consulta: dict, contagem: dict, frescor) -> dict:
 @require_GET
 def obter_consulta_agenda(request, consulta_id: str):
     """GET /api/v1/agendas/consultas/{id} (design doc §10, SPEC03 §7.2)."""
-    db = get_db(request.financiador_id)
-    linhas = db.table("consulta_agenda").select("*").eq("id", consulta_id).execute().data
-    if not linhas:
-        return JsonResponse(
-            {"erro": "CONSULTA_NAO_ENCONTRADA", "mensagem": f"consulta {consulta_id!r} não encontrada"}, status=404,
-        )
+    try:
+        db = get_db(request.financiador_id)
+        linhas = db.table("consulta_agenda").select("*").eq("id", consulta_id).execute().data
+        if not linhas:
+            return JsonResponse(
+                {"erro": "CONSULTA_NAO_ENCONTRADA", "mensagem": f"consulta {consulta_id!r} não encontrada"}, status=404,
+            )
 
-    contagem, frescor = _contagem_e_frescor_por_origem(db, consulta_id)
-    return JsonResponse(_serializar_consulta(linhas[0], contagem, frescor), status=200)
+        contagem, frescor = _contagem_e_frescor_por_origem(db, consulta_id)
+        return JsonResponse(_serializar_consulta(linhas[0], contagem, frescor), status=200)
+    except Exception:
+        logger.exception(
+            "[Consultas] Falha inesperada ao obter consulta (financiador=%s, consulta_id=%s)",
+            request.financiador_id, consulta_id,
+        )
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao processar a consulta"}, status=500)
 
 
 def _serializar_politica(politica: dict) -> dict:
@@ -527,9 +534,16 @@ def _upsert_politica(request):
     except json.JSONDecodeError:
         return JsonResponse({"erro": "CORPO_INVALIDO", "mensagem": "corpo não é JSON válido"}, status=400)
 
+    if not isinstance(payload, dict):
+        return JsonResponse({"erro": "CORPO_INVALIDO", "mensagem": "corpo deve ser um objeto JSON"}, status=400)
+
     motivo = payload.get("motivo")
     if not motivo:
         return JsonResponse({"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": "motivo é obrigatório"}, status=400)
+    if not isinstance(motivo, str):
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": "motivo deve ser uma string"}, status=400,
+        )
 
     try:
         validar_modos_permitidos(payload.get("modosPermitidos"))
@@ -579,8 +593,15 @@ def politicas_consulta(request):
     automático porque cada um tem seu próprio banco (nenhuma checagem de
     propriedade extra é necessária). DELETE nunca apaga a linha — só
     desativa (Global Constraints deste plano)."""
-    if request.method == "GET":
-        return _listar_politicas(request)
-    if request.method == "PUT":
-        return _upsert_politica(request)
-    return _desativar_politica(request)
+    try:
+        if request.method == "GET":
+            return _listar_politicas(request)
+        if request.method == "PUT":
+            return _upsert_politica(request)
+        return _desativar_politica(request)
+    except Exception:
+        logger.exception(
+            "[PoliticasConsulta] Falha inesperada (financiador=%s, method=%s)",
+            request.financiador_id, request.method,
+        )
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao processar a política"}, status=500)

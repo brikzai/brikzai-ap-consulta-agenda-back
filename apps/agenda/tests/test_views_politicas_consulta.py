@@ -107,6 +107,16 @@ def test_put_motivo_ausente_retorna_400(keypair):
     assert response.status_code == 400
 
 
+def test_put_corpo_nao_dict_retorna_400(keypair):
+    private_pem, _ = keypair
+    response = Client().put(
+        URL, data=json.dumps(["not", "a", "dict"]),
+        content_type="application/json", HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 400
+    assert response.json()["erro"] == "CORPO_INVALIDO"
+
+
 def test_get_lista_politicas(keypair):
     private_pem, _ = keypair
     Client().put(
