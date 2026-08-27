@@ -605,3 +605,102 @@ def politicas_consulta(request):
             request.financiador_id, request.method,
         )
         return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao processar a política"}, status=500)
+
+
+_LIMITE_PADRAO_LISTAGEM = 100
+_LIMITE_MAXIMO_LISTAGEM = 1000
+
+_FILTROS_URS = {
+    "ufr": "documento_ufr", "titular": "documento_titular",
+    "credenciadora": "cnpj_credenciadora", "arranjo": "codigo_arranjo",
+    "constituicao": "constituicao", "origem": "origem",
+}
+
+
+def _parse_limite(request, maximo: int = _LIMITE_MAXIMO_LISTAGEM) -> int:
+    bruto = request.GET.get("limit")
+    if not bruto:
+        return _LIMITE_PADRAO_LISTAGEM
+    try:
+        valor = int(bruto)
+    except ValueError:
+        raise ValueError(f"limit deve ser um inteiro: {bruto!r}")
+    if valor <= 0 or valor > maximo:
+        raise ValueError(f"limit deve estar entre 1 e {maximo}: {valor}")
+    return valor
+
+
+def _pagina_com_cursor(query, campo_cursor: str, cursor, limite: int) -> tuple:
+    """Keyset pagination genérica: busca limite+1 linhas ordenadas por
+    campo_cursor, corta a linha extra e usa o cursor dela como
+    proximoCursor — evita um SELECT COUNT(*) só pra saber se há mais
+    página. Reaproveitada por listar_urs (Task 3) e relatorio_compliance
+    (Task 5)."""
+    if cursor is not None:
+        query = query.gt(campo_cursor, cursor)
+    linhas = query.order(campo_cursor).limit(limite + 1).execute().data
+    tem_mais = len(linhas) > limite
+    pagina = linhas[:limite]
+    proximo_cursor = pagina[-1][campo_cursor] if tem_mais and pagina else None
+    return pagina, proximo_cursor
+
+
+def _serializar_ur(ur: dict) -> dict:
+    return {
+        "entidadeRegistradora": ur["entidade_registradora"],
+        "cnpjCredenciadora": ur["cnpj_credenciadora"],
+        "documentoUfr": ur["documento_ufr"],
+        "documentoTitular": ur["documento_titular"],
+        "codigoArranjo": ur["codigo_arranjo"],
+        "dataLiquidacao": ur["data_liquidacao"].isoformat(),
+        "constituicao": ur["constituicao"],
+        "valorConstituidoTotal": ur["valor_constituido_total"],
+        "valorConstituidoAntecipacaoPre": ur["valor_constituido_antecipacao_pre"],
+        "valorBloqueado": ur["valor_bloqueado"],
+        "valorLivre": ur["valor_livre"],
+        "valorTotalUR": ur["valor_total_ur"],
+        "carteira": ur["carteira"],
+        "dataHoraUltimaAtualizacao": _como_datetime(ur["data_hora_ultima_atualizacao"]).isoformat(),
+        "origem": ur["origem"],
+        "origemArquivo": ur["origem_arquivo"],
+    }
+
+
+@jwt_required
+@require_GET
+def listar_urs(request):
+    """GET /api/v1/agendas/urs (design doc §10, SPEC03 §7.3) — repositório
+    consolidado, não chama a CERC. Paginação por cursor sobre
+    agenda_ur.sequencia (Plano 10, Global Constraints)."""
+    try:
+        cursor_bruto = request.GET.get("cursor")
+        cursor = int(cursor_bruto) if cursor_bruto else None
+        limite = _parse_limite(request)
+    except ValueError as exc:
+        return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
+
+    try:
+        db = get_db(request.financiador_id)
+        query = db.table("agenda_ur").select("*")
+        for parametro, coluna in _FILTROS_URS.items():
+            valor = request.GET.get(parametro)
+            if valor:
+                query = query.eq(coluna, valor)
+
+        data_inicio = request.GET.get("dataLiquidacaoInicio")
+        data_fim = request.GET.get("dataLiquidacaoFim")
+        atualizado_desde = request.GET.get("atualizadoDesde")
+        if data_inicio:
+            query = query.gte("data_liquidacao", data_inicio)
+        if data_fim:
+            query = query.lte("data_liquidacao", data_fim)
+        if atualizado_desde:
+            query = query.gte("atualizado_em", atualizado_desde)
+
+        pagina, proximo_cursor = _pagina_com_cursor(query, "sequencia", cursor, limite)
+        return JsonResponse(
+            {"urs": [_serializar_ur(ur) for ur in pagina], "proximoCursor": proximo_cursor}, status=200,
+        )
+    except Exception:
+        logger.exception("[AgendasUrs] Falha inesperada ao listar (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao listar URs"}, status=500)
