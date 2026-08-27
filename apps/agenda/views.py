@@ -6,13 +6,14 @@ import logging
 from datetime import date, datetime, timezone
 
 from django.http import JsonResponse
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 from sqlalchemy.exc import DBAPIError
 from ulid import ULID
 
 from apps.agenda import parser_ap005
 from apps.agenda.correlacao import encontrar_consultas_candidatas
 from apps.agenda.importar_ap005 import importar_arquivo
+from apps.agenda.repository import _CHAVE_UR, _buscar_um
 from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.validation import ValidacaoConsultaError
 from apps.agenda.webhook_dedupe import hash_evento
@@ -446,3 +447,58 @@ def criar_consulta_agenda(request):
         {"consultaId": resultado["consultaId"], "status": resultado["status"], "agendas": resultado["agendas"]},
         status=status_http,
     )
+
+
+def _contagem_e_frescor_por_origem(db, consulta_id: str) -> tuple:
+    """Única fonte de verdade pra contagem por origem desde que Task 2
+    deste plano passou a gravar SINCRONO em consulta_agenda_ur (fecha
+    design doc §15 risco 14) — WEBHOOK já era gravado pelo Plano 07.
+    ARQUIVO fica sempre 0: a ingestão de arquivo (Plano 08) nunca associa
+    uma UR a uma consulta_agenda, não existe consulta nesse fluxo."""
+    vinculos = db.table("consulta_agenda_ur").select("*").eq("consulta_id", consulta_id).execute().data
+    contagem = {"SINCRONO": 0, "WEBHOOK": 0, "ARQUIVO": 0}
+    timestamps = []
+    for vinculo in vinculos:
+        contagem[vinculo["origem"]] = contagem.get(vinculo["origem"], 0) + 1
+        chave = {campo: vinculo[campo] for campo in _CHAVE_UR}
+        ur = _buscar_um(db, "agenda_ur", chave, _CHAVE_UR)
+        if ur:
+            timestamps.append(ur["data_hora_ultima_atualizacao"])
+
+    frescor = None
+    if timestamps:
+        frescor = {"maisAntigo": min(timestamps).isoformat(), "maisRecente": max(timestamps).isoformat()}
+    return contagem, frescor
+
+
+def _serializar_consulta(consulta: dict, contagem: dict, frescor) -> dict:
+    return {
+        "consultaId": consulta["id"],
+        "modo": consulta["modo"],
+        "status": consulta["status"],
+        "filtroUfr": consulta["filtro_ufr"],
+        "filtroTitular": consulta["filtro_titular"],
+        "filtroCredenciadoras": consulta["filtro_credenciadoras"],
+        "filtroArranjos": consulta["filtro_arranjos"],
+        "filtroDataInicio": consulta["filtro_data_inicio"].isoformat(),
+        "filtroDataFim": consulta["filtro_data_fim"].isoformat(),
+        "contagemPorOrigem": contagem,
+        "frescor": frescor,
+        "iniciadaEm": consulta["iniciada_em"].isoformat(),
+        "encerradaEm": consulta["encerrada_em"].isoformat() if consulta["encerrada_em"] else None,
+    }
+
+
+@jwt_required
+@require_GET
+def obter_consulta_agenda(request, consulta_id: str):
+    """GET /api/v1/agendas/consultas/{id} (design doc §10, SPEC03 §7.2)."""
+    db = get_db(request.financiador_id)
+    linhas = db.table("consulta_agenda").select("*").eq("id", consulta_id).execute().data
+    if not linhas:
+        return JsonResponse(
+            {"erro": "CONSULTA_NAO_ENCONTRADA", "mensagem": f"consulta {consulta_id!r} não encontrada"}, status=404,
+        )
+
+    contagem, frescor = _contagem_e_frescor_por_origem(db, consulta_id)
+    return JsonResponse(_serializar_consulta(linhas[0], contagem, frescor), status=200)
