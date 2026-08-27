@@ -728,9 +728,10 @@ def posicao_urs(request):
     """GET /api/v1/agendas/urs/posicao (design doc §10, SPEC03 §7.4) —
     visão agregada de crédito por UFR/janela. valorFumaca (constituicao=2)
     é sempre segregado: nunca soma em valorTotalConstituido/porCredenciadora
-    /porArranjo/valorOnerado (Global Constraints deste plano). Sem JOIN:
-    valorOnerado roda como query separada sobre agenda_ur_pagamento com os
-    mesmos filtros de coluna compartilhados."""
+    /porArranjo. Sem JOIN: valorOnerado roda como query separada sobre
+    agenda_ur_pagamento com os mesmos filtros de coluna compartilhados —
+    mas sem filtro de constituicao, ver limitação conhecida no comentário
+    junto dessa query, abaixo."""
     faltando = [c for c in _CAMPOS_OBRIGATORIOS_POSICAO if not request.GET.get(c)]
     if faltando:
         return JsonResponse(

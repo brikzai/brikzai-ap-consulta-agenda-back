@@ -52,6 +52,20 @@ def _linha_ur(cnpj_credenciadora: str, codigo_arranjo: str, constituicao: str, v
     }
 
 
+def _linha_pagamento(cnpj_credenciadora: str, codigo_arranjo: str, valor_onerado, tipo_informacao_pagamento: str):
+    return {
+        "data_liquidacao": "2026-09-20",
+        "entidade_registradora": "22246686000196",
+        "cnpj_credenciadora": cnpj_credenciadora,
+        "documento_ufr": UFR_TESTE,
+        "documento_titular": UFR_TESTE,
+        "codigo_arranjo": codigo_arranjo,
+        "tipo_informacao_pagamento": tipo_informacao_pagamento,
+        "valor_onerado": valor_onerado,
+        "domicilio": {},
+    }
+
+
 def _limpar():
     db = get_db(FINANCIADOR_TESTE)
     db.table("agenda_ur_pagamento").delete().eq("documento_ufr", UFR_TESTE).execute()
@@ -85,6 +99,8 @@ def test_agrega_por_credenciadora_arranjo_e_segrega_fumaca(keypair):
     db.table("agenda_ur").insert(_linha_ur("AAA", "VCC", "1", 100, valor_bloqueado=20, valor_livre=80)).execute()
     db.table("agenda_ur").insert(_linha_ur("AAA", "VCD", "1", 50, valor_bloqueado=0, valor_livre=50)).execute()
     db.table("agenda_ur").insert(_linha_ur("BBB", "VCC", "2", 999, valor_bloqueado=0, valor_livre=0)).execute()  # fumaça
+    db.table("agenda_ur_pagamento").insert(_linha_pagamento("AAA", "VCC", 30, "1")).execute()
+    db.table("agenda_ur_pagamento").insert(_linha_pagamento("AAA", "VCC", 15, "2")).execute()
 
     response = Client().get(
         f"{URL}?ufr={UFR_TESTE}&dataLiquidacaoInicio=2026-09-01&dataLiquidacaoFim=2026-09-30",
@@ -97,6 +113,7 @@ def test_agrega_por_credenciadora_arranjo_e_segrega_fumaca(keypair):
     assert Decimal(corpo["valorBloqueado"]) == Decimal("20.00")
     assert Decimal(corpo["valorLivre"]) == Decimal("130.00")
     assert Decimal(corpo["valorFumaca"]) == Decimal("999.00")
+    assert Decimal(corpo["valorOnerado"]) == Decimal("45.00")
 
     por_credenciadora = {p["cnpjCredenciadora"]: Decimal(p["valorTotalConstituido"]) for p in corpo["porCredenciadora"]}
     assert por_credenciadora == {"AAA": Decimal("150.00")}  # BBB é só fumaça — não aparece aqui
