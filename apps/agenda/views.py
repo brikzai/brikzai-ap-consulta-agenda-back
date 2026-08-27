@@ -766,6 +766,13 @@ def posicao_urs(request):
             request,
         ).group_by("codigo_arranjo").execute().data
 
+        # valorOnerado não filtra por constituicao='1' porque agenda_ur_pagamento
+        # não tem essa coluna, e este plano não tem suporte a JOIN/IN pra
+        # alcançar agenda_ur.constituicao a partir daqui (limitação conhecida,
+        # não um esquecimento). Assunção: URs fumaça (constituicao='2', ainda
+        # não constituídas) não têm pagamentos/efeitos de liquidação associados
+        # — representam uma expectativa futura, não uma UR real ainda. Reavaliar
+        # junto do risco 20 (design doc) quando um filtro IN for construído.
         onerado = _aplicar_filtros_posicao(
             db.table("agenda_ur_pagamento").select("COALESCE(SUM(valor_onerado),0) AS total"), request,
         ).execute().data
