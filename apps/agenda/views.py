@@ -811,3 +811,79 @@ def posicao_urs(request):
     except Exception:
         logger.exception("[AgendasUrsPosicao] Falha inesperada (financiador=%s)", request.financiador_id)
         return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao calcular posição"}, status=500)
+
+
+def _serializar_consulta_compliance(consulta: dict) -> dict:
+    return {
+        "consultaId": consulta["id"],
+        "modo": consulta["modo"],
+        "status": consulta["status"],
+        "filtroUfr": consulta["filtro_ufr"],
+        "filtroTitular": consulta["filtro_titular"],
+        "filtroCredenciadoras": consulta["filtro_credenciadoras"],
+        "filtroArranjos": consulta["filtro_arranjos"],
+        "filtroDataInicio": consulta["filtro_data_inicio"].isoformat(),
+        "filtroDataFim": consulta["filtro_data_fim"].isoformat(),
+        "tipoAvaliacao": consulta["tipo_avaliacao"],
+        "carteira": consulta["carteira"],
+        "baseAutorizativaTipo": consulta["base_autorizativa_tipo"],
+        "baseAutorizativaId": consulta["base_autorizativa_id"],
+        "motivo": consulta["motivo"],
+        "ator": consulta["ator"],
+        "origemIp": consulta["origem_ip"],
+        "qtdUrsSincrono": consulta["qtd_urs_sincrono"],
+        "qtdUrsWebhook": consulta["qtd_urs_webhook"],
+        "iniciadaEm": consulta["iniciada_em"].isoformat(),
+        "ultimaUrEm": consulta["ultima_ur_em"].isoformat() if consulta["ultima_ur_em"] else None,
+        "encerradaEm": consulta["encerrada_em"].isoformat() if consulta["encerrada_em"] else None,
+    }
+
+
+_CAMPOS_OBRIGATORIOS_RELATORIO = ("dataInicio", "dataFim")
+
+
+@jwt_required
+@require_GET
+def relatorio_compliance(request):
+    """GET /api/v1/compliance/relatorio (design doc §10/§11, SPEC03 §8
+    item 5) — trilha de compliance completa, síncrona e paginada por
+    cursor sobre consulta_agenda.id (ULID, já ordenável por tempo de
+    criação — Global Constraints deste plano, sem coluna nova). Sem
+    exportação CSV/job assíncrono — design doc §11 explicitamente adia
+    isso pra quando houver necessidade comprovada."""
+    faltando = [c for c in _CAMPOS_OBRIGATORIOS_RELATORIO if not request.GET.get(c)]
+    if faltando:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": f"parâmetros obrigatórios ausentes: {', '.join(faltando)}"},
+            status=400,
+        )
+
+    try:
+        data_inicio = _parse_data_iso(request.GET.get("dataInicio"), "dataInicio")
+        data_fim = _parse_data_iso(request.GET.get("dataFim"), "dataFim")
+        limite = _parse_limite(request)
+    except ValueError as exc:
+        return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
+
+    inicio_dt = datetime.combine(data_inicio, datetime.min.time(), tzinfo=timezone.utc)
+    fim_dt = datetime.combine(data_fim, datetime.max.time(), tzinfo=timezone.utc)
+    cursor = request.GET.get("cursor") or None
+
+    try:
+        db = get_db(request.financiador_id)
+        query = db.table("consulta_agenda").select("*").gte("iniciada_em", inicio_dt).lte("iniciada_em", fim_dt)
+        ufr = request.GET.get("ufr")
+        ator = request.GET.get("ator")
+        if ufr:
+            query = query.eq("filtro_ufr", ufr)
+        if ator:
+            query = query.eq("ator", ator)
+
+        pagina, proximo_cursor = _pagina_com_cursor(query, "id", cursor, limite)
+        return JsonResponse(
+            {"consultas": [_serializar_consulta_compliance(c) for c in pagina], "proximoCursor": proximo_cursor},
+            status=200,
+        )
+    except Exception:
+        logger.exception("[ComplianceRelatorio] Falha inesperada (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao gerar relatório"}, status=500)

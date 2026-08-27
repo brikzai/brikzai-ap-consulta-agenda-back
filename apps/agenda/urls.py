@@ -12,4 +12,5 @@ urlpatterns = [
     path("config/politicas-consulta", views.politicas_consulta),
     path("agendas/urs", views.listar_urs),
     path("agendas/urs/posicao", views.posicao_urs),
+    path("compliance/relatorio", views.relatorio_compliance),
 ]
