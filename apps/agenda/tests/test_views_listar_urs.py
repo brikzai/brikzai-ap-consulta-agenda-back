@@ -117,3 +117,34 @@ def test_limit_acima_do_maximo_retorna_400(keypair):
     response = Client().get(f"{URL}?limit=1001", HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}")
     assert response.status_code == 400
     assert response.json()["erro"] == "PARAMETRO_INVALIDO"
+
+
+def test_filtro_data_liquidacao_intervalo_restringe_resultado(keypair):
+    private_pem, _ = keypair
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("agenda_ur").insert(_linha("VCA", "2026-09-10")).execute()
+    db.table("agenda_ur").insert(_linha("VCC", "2026-09-20")).execute()
+    db.table("agenda_ur").insert(_linha("VCE", "2026-09-30")).execute()
+
+    response = Client().get(
+        f"{URL}?ufr={UFR_TESTE}&dataLiquidacaoInicio=2026-09-15&dataLiquidacaoFim=2026-09-25",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 200
+    corpo = response.json()
+    assert {ur["codigoArranjo"] for ur in corpo["urs"]} == {"VCC"}
+
+
+def test_filtro_atualizado_desde_exclui_registro_mais_antigo(keypair):
+    private_pem, _ = keypair
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("agenda_ur").insert({**_linha("VCA", "2026-09-20"), "atualizado_em": "2026-01-01T00:00:00-03:00"}).execute()
+    db.table("agenda_ur").insert({**_linha("VCC", "2026-09-21"), "atualizado_em": "2026-09-01T00:00:00-03:00"}).execute()
+
+    response = Client().get(
+        f"{URL}?ufr={UFR_TESTE}&atualizadoDesde=2026-06-01T00:00:00-03:00",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 200
+    corpo = response.json()
+    assert {ur["codigoArranjo"] for ur in corpo["urs"]} == {"VCC"}
