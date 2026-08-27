@@ -188,3 +188,80 @@ def test_invalid_column_name_rejected_in_filter():
     db = get_db(FINANCIADOR_TESTE)
     with pytest.raises(ValueError):
         db.table("dominio_arranjo").select("*").eq("codigo = '1'; DROP TABLE dominio_arranjo; --", "x").execute()
+
+
+def test_gt_filter_excludes_equal_values():
+    db = get_db(FINANCIADOR_TESTE)
+    db.table("dominio_arranjo").delete().eq("codigo", "GT1").execute()
+    db.table("dominio_arranjo").delete().eq("codigo", "GT2").execute()
+    try:
+        db.table("dominio_arranjo").insert({
+            "codigo": "GT1", "descricao": "A", "ativo": True,
+            "atualizado_em": "2026-01-01T00:00:00-03:00",
+        }).execute()
+        db.table("dominio_arranjo").insert({
+            "codigo": "GT2", "descricao": "B", "ativo": True,
+            "atualizado_em": "2026-06-01T00:00:00-03:00",
+        }).execute()
+
+        resultado = db.table("dominio_arranjo").select("*").gt(
+            "atualizado_em", "2026-01-01T00:00:00-03:00"
+        ).execute()
+        codigos = {r["codigo"] for r in resultado.data}
+        assert codigos == {"GT2"}  # estritamente maior — GT1 (valor igual) fica de fora
+    finally:
+        db.table("dominio_arranjo").delete().eq("codigo", "GT1").execute()
+        db.table("dominio_arranjo").delete().eq("codigo", "GT2").execute()
+
+
+def test_group_by_aggregates_with_sum():
+    db = get_db(FINANCIADOR_TESTE)
+    chave_base = {
+        "entidade_registradora": "22246686000196",
+        "documento_ufr": "TESTE-GROUPBY-UFR",
+        "documento_titular": "TESTE-GROUPBY-UFR",
+        "data_liquidacao": "2026-09-20",
+    }
+    linhas = [
+        {**chave_base, "cnpj_credenciadora": "AAA", "codigo_arranjo": "VCC",
+         "constituicao": "1", "valor_constituido_total": 100, "valor_total_ur": 100},
+        {**chave_base, "cnpj_credenciadora": "AAA", "codigo_arranjo": "VCD",
+         "constituicao": "1", "valor_constituido_total": 50, "valor_total_ur": 50},
+        {**chave_base, "cnpj_credenciadora": "BBB", "codigo_arranjo": "VCC",
+         "constituicao": "1", "valor_constituido_total": 30, "valor_total_ur": 30},
+    ]
+
+    def _limpar():
+        for linha in linhas:
+            db.table("agenda_ur").delete().eq("cnpj_credenciadora", linha["cnpj_credenciadora"]).eq(
+                "codigo_arranjo", linha["codigo_arranjo"]
+            ).eq("documento_ufr", chave_base["documento_ufr"]).eq(
+                "data_liquidacao", chave_base["data_liquidacao"]
+            ).execute()
+
+    _limpar()
+    try:
+        for linha in linhas:
+            db.table("agenda_ur").insert({
+                **linha,
+                "data_hora_ultima_atualizacao": "2026-09-19T10:00:00-03:00",
+                "origem": "SINCRONO",
+            }).execute()
+
+        resultado = db.table("agenda_ur").select(
+            "cnpj_credenciadora, COALESCE(SUM(valor_constituido_total),0) AS total"
+        ).eq("documento_ufr", chave_base["documento_ufr"]).group_by("cnpj_credenciadora").order(
+            "cnpj_credenciadora"
+        ).execute()
+
+        por_credenciadora = {r["cnpj_credenciadora"]: r["total"] for r in resultado.data}
+        assert por_credenciadora["AAA"] == 150
+        assert por_credenciadora["BBB"] == 30
+    finally:
+        _limpar()
+
+
+def test_invalid_column_name_rejected_in_group_by():
+    db = get_db(FINANCIADOR_TESTE)
+    with pytest.raises(ValueError):
+        db.table("dominio_arranjo").select("*").group_by("codigo; DROP TABLE dominio_arranjo; --")

@@ -49,6 +49,7 @@ class QueryBuilder:
         self._filters: List[tuple] = []
         self._order_by: List[tuple] = []
         self._limit_val: Optional[int] = None
+        self._group_by: List[str] = []
         self._op = "select"
         self._insert_data = None
         self._update_data: Optional[dict] = None
@@ -72,6 +73,17 @@ class QueryBuilder:
     def lte(self, field: str, value: Any) -> "QueryBuilder":
         _validate_identifier(field, "coluna")
         self._filters.append(("lte", field, value))
+        return self
+
+    def gt(self, field: str, value: Any) -> "QueryBuilder":
+        _validate_identifier(field, "coluna")
+        self._filters.append(("gt", field, value))
+        return self
+
+    def group_by(self, *fields: str) -> "QueryBuilder":
+        for field in fields:
+            _validate_identifier(field, "coluna")
+        self._group_by = list(fields)
         return self
 
     def order(self, field: str, desc: bool = False) -> "QueryBuilder":
@@ -122,7 +134,7 @@ class QueryBuilder:
         if not self._filters:
             return "", {}
         clauses, params = [], {}
-        operadores = {"eq": "=", "gte": ">=", "lte": "<="}
+        operadores = {"eq": "=", "gte": ">=", "lte": "<=", "gt": ">"}
         for i, (op, field, val) in enumerate(self._filters):
             pname = f"p{i}"
             clauses.append(f"{field} {operadores[op]} :{pname}")
@@ -165,13 +177,14 @@ class QueryBuilder:
                 sql = f"SELECT COUNT(*) FROM {self._table} {where}"
                 return ExecuteResult(data=[], count=conn.execute(text(sql), params).scalar())
 
+            group_clause = f"GROUP BY {', '.join(self._group_by)}" if self._group_by else ""
             order_clause = ""
             if self._order_by:
                 parts = [f"{f} {'DESC' if d else 'ASC'}" for f, d in self._order_by]
                 order_clause = "ORDER BY " + ", ".join(parts)
             limit_clause = f"LIMIT {self._limit_val}" if self._limit_val else ""
 
-            sql = f"SELECT {self._select_fields} FROM {self._table} {where} {order_clause} {limit_clause}"
+            sql = f"SELECT {self._select_fields} FROM {self._table} {where} {group_clause} {order_clause} {limit_clause}"
             result = conn.execute(text(sql), params)
             return ExecuteResult(data=[self._deserialize_row(dict(r._mapping)) for r in result])
 
