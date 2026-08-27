@@ -131,3 +131,24 @@ def test_data_invalida_retorna_400(keypair):
     )
     assert response.status_code == 400
     assert response.json()["erro"] == "PARAMETRO_INVALIDO"
+
+
+def test_janela_usa_fuso_america_sao_paulo_nao_utc(keypair):
+    """Uma consulta às 22h (horário de Brasília) do último dia do período
+    ainda está em 01h UTC do dia seguinte — se a janela fosse calculada em
+    UTC (bug original), essa linha seria excluída de dataFim=2026-09-30."""
+    private_pem, _ = keypair
+    db = get_db(FINANCIADOR_TESTE)
+    # 2026-09-30T22:00:00-03:00 == 2026-10-01T01:00:00Z
+    db.table("consulta_agenda").insert(_consulta("analista.fronteira@teste.com", "2026-09-30T22:00:00-03:00")).execute()
+    # 2026-10-01T00:30:00-03:00 (dia seguinte em SP) deve ficar fora da janela
+    db.table("consulta_agenda").insert(_consulta("analista.fora@teste.com", "2026-10-01T00:30:00-03:00")).execute()
+
+    response = Client().get(
+        f"{URL}?dataInicio=2026-09-01&dataFim=2026-09-30&ufr={UFR_TESTE}",
+        HTTP_AUTHORIZATION=f"Bearer {_token(private_pem)}",
+    )
+    assert response.status_code == 200
+    atores = {c["ator"] for c in response.json()["consultas"]}
+    assert "analista.fronteira@teste.com" in atores
+    assert "analista.fora@teste.com" not in atores

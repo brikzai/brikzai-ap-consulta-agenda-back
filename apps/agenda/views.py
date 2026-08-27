@@ -3,7 +3,7 @@ import hmac
 import io
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
@@ -16,6 +16,7 @@ from apps.agenda.importar_ap005 import importar_arquivo
 from apps.agenda.repository import _CHAVE_UR, _buscar_um, _como_datetime
 from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.validation import ValidacaoConsultaError, validar_modos_permitidos
+from apps.agenda.validation import _FUSO_CONSULTA
 from apps.agenda.webhook_dedupe import hash_evento
 from services.cerc.client import (
     CercConsultaCriticaError,
@@ -865,8 +866,15 @@ def relatorio_compliance(request):
     except ValueError as exc:
         return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
 
-    inicio_dt = datetime.combine(data_inicio, datetime.min.time(), tzinfo=timezone.utc)
-    fim_dt = datetime.combine(data_fim, datetime.max.time(), tzinfo=timezone.utc)
+    # Dia calendário em America/Sao_Paulo, não UTC (mesma convenção de
+    # apps.agenda.validation._FUSO_CONSULTA/A08) — janela [início, fim+1dia)
+    # tratada como fechada no fim via -1 microssegundo, já que QueryBuilder
+    # não tem operador "menor que" (só gte/lte/gt).
+    inicio_dt = datetime.combine(data_inicio, datetime.min.time(), tzinfo=_FUSO_CONSULTA)
+    fim_dt = (
+        datetime.combine(data_fim + timedelta(days=1), datetime.min.time(), tzinfo=_FUSO_CONSULTA)
+        - timedelta(microseconds=1)
+    )
     cursor = request.GET.get("cursor") or None
 
     try:
