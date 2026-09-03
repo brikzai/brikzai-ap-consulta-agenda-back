@@ -356,5 +356,64 @@ criação do job) → `401` (propagação de IAM/OIDC ainda não tinha completad
 comportamento já visto no runbook do optin); disparo manual ~1min depois e tick automático
 seguinte → `200`.
 
+## 11. Teste real contra a CERC (2026-09-03) — 4 bugs achados e corrigidos
+
+Primeiro `POST /api/v1/agendas/consultas` (modo ONLINE) contra a CERC de homologação
+real, UFR `15076963000146`, credenciadoras `72253725000100`/`09700540000152`/
+`49240077000128`, arranjos `["99T"]`. Nenhum dos quatro problemas abaixo apareceria
+rodando só os testes unitários (todos usam `respx` com corpo mockado no formato que a
+SPEC03 documenta) — só a chamada real contra a CERC de verdade expôs.
+
+Pré-requisito descoberto no caminho: a validação A10 (fail-closed) exige uma
+`politica_consulta` ativa pro `motivo` usado — criada via `PUT /api/v1/config/politicas-consulta`
+antes do teste (tenant recém-provisionado não tem nenhuma).
+
+1. **OAuth2 via corpo, não Basic Auth.** `services/cerc/token_provider.py` mandava
+   `client_id`/`client_secret` como parâmetros do corpo do POST; a CERC exige HTTP Basic
+   Auth (RFC 6749 §2.3.1) e respondia `401` sem mais detalhe — `optin-service` já fazia
+   isso certo (`auth=(client_id, client_secret)` no httpx), esta cópia divergiu. Corrigido
+   + teste novo (`test_fetch_token_usa_basic_auth_nao_body`) que verifica o header
+   `Authorization: Basic` e que client_id/secret não vazam pro corpo.
+2. **Resposta embrulhada, não array puro.** SPEC03 §4.3 documenta `200` como array de
+   agendas; a CERC de homologação devolve `{"agendas": [...], "protocoloRequisicao": ...,
+   "indicadoresConsistencia": [...], "documentoUsuarioFinalRecebedor": ...}`. Corrigido em
+   `_chamar_cerc` (aceita os dois formatos).
+3. **`documentoUsuarioFinalRecebedor` no envelope, não por item.** Consequência do achado
+   2: esse campo vem uma vez no objeto de fora, não repetido em cada item de `agendas`
+   como `_traduzir_ur` esperava (`KeyError`, 2652 URs foram pra `agenda_ur_rejeitada` antes
+   do fix). Corrigido propagando o valor do envelope pra cada item antes de devolver.
+4. **`dataHoraUltimaAtualizacao` ausente na resposta síncrona real.** SPEC03 §4.3
+   documenta esse campo por titular; a CERC de homologação simplesmente não o manda na
+   resposta síncrona (mais 1326 URs rejeitadas até esse fix). Corrigido com fallback pra
+   `datetime.now(timezone.utc)` quando ausente — semanticamente correto: é uma consulta
+   síncrona, "agora" é o dado mais fresco que temos. Teste novo
+   (`test_consultar_agenda_sem_data_hora_ultima_atualizacao_usa_agora`).
+
+**Achado de infra, não de API:** o `Dockerfile` deste serviço nunca passava `--timeout`
+pro gunicorn (default 30s) nem usava `${WEB_CONCURRENCY:-2}` pros workers — divergiu do
+`Dockerfile` do optin, que já faz os dois certo. Com 1326 URs inseridas uma a uma na mesma
+requisição síncrona (nenhuma escrita em lote — mesma decisão consciente "não otimizar
+antes de medir" do design doc §15), o worker do gunicorn matava a requisição no meio antes
+mesmo do timeout de 60s do Cloud Run (`cloudbuild.yaml`) entrar em ação. Corrigido pra
+`--timeout 60` (mesmo valor do Cloud Run, mesmo padrão do optin). Uma consulta ONLINE
+desse tamanho (todas as credenciadoras, ~8 meses, `"99T"`) ainda é lenta o bastante pra
+chegar perto do limite de 60s — se isso vier a ser um padrão de uso real (não só teste),
+revisitar a escrita em lote de `upsert_agenda_ur` é candidato natural, mas não foi feito
+aqui (fora de escopo desta verificação).
+
+**Resultado final, com os 5 fixes acima (4 de API + 1 de infra) e o Dockerfile já revertido
+pro timeout de produção (60s):** consulta `01M1MQ52GFJ9WD68C400VMH5EH` fechada como
+`PARCIAL` (correto — ONLINE), **1326 URs reais persistidas** (`contagemPorOrigem.SINCRONO
+= 1326`), confirmado via `GET /agendas/consultas/{id}`, `GET /agendas/urs` e `GET
+/agendas/urs/posicao` (retornou posição agregada real: ~R$6,58M constituídos, segregado
+por credenciadora e por arranjo, `valorFumaca` sempre à parte). O deploy que rodou esse
+teste específico usou timeouts temporariamente esticados (Cloud Run e gunicorn a 300s) só
+pra essa verificação única; o deploy final já está de volta em 60s.
+
+**Pendência que sobrou:** as credenciais CERC seguem emprestadas do optin-service (ponto
+já registrado na seção 9) — funcionaram para autenticar e consultar, mas a CERC pode vir a
+diferenciar por produto/serviço no futuro; trocar quando existir credencial própria pro
+agenda-service.
+
 **agenda-service em homolog está no ar e servindo tráfego real:**
 `https://agenda-service-6sy5bhymwq-rj.a.run.app`
