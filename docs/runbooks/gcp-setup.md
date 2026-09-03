@@ -247,13 +247,38 @@ Feito em 2026-09-03: primeiro `gcloud builds submit --substitutions=_TAG=<sha>` 
 `cloudbuild.yaml` (substituição `_PUBSUB_PUSH_AUDIENCE`), então deploys futuros não
 regridem pro placeholder.
 
-## 8b. Deploy automático (Cloud Build trigger) — pendente
+## 8b. Deploy automático (Cloud Build trigger)
 
 O `optin-service` migrou de remote pessoal para `github.com/brikzai/ap-optin-back` e tem
-um trigger configurado (seção 5b do runbook dele). Este repositório ainda está em
-`github.com/rdelimasilva/ap-back-consulta-agenda` (remote pessoal) — decisão de mover pra
-um repo da org e configurar o trigger fica pendente, não é decisão de infra que este
-runbook deva tomar sozinho.
+um trigger configurado (seção 5b do runbook dele) — mesmo padrão replicado aqui.
+
+Repositório registrado sob a MESMA conexão GitHub App do optin (`optin-github`, já
+autorizada na org `brikzai` — não precisou de novo consentimento no GitHub):
+
+    gcloud builds repositories create agenda-back --connection=optin-github \
+      --region=southamerica-east1 \
+      --remote-uri=https://github.com/brikzai/brikzai-ap-consulta-agenda-back.git
+
+Trigger (push na `master` → build + deploy, sem aprovação manual, mesmo molde do
+`optin-deploy-master`):
+
+    gcloud builds triggers create github \
+      --name=agenda-deploy-master \
+      --region=southamerica-east1 \
+      --repository=projects/brikz-ap/locations/southamerica-east1/connections/optin-github/repositories/agenda-back \
+      --branch-pattern="^master$" \
+      --build-config=cloudbuild.yaml \
+      --service-account=projects/brikz-ap/serviceAccounts/agenda-build@brikz-ap.iam.gserviceaccount.com \
+      --substitutions=_TAG='$SHORT_SHA' \
+      --description="Deploy automático do agenda-service a cada push na master"
+
+Feito em 2026-09-03: remote pessoal (`github.com/rdelimasilva/ap-back-consulta-agenda`)
+mantido como está; repositório da org criado em `github.com/brikzai/brikzai-ap-consulta-agenda-back`
+e adicionado como remote `brikzai` neste checkout. Repositório `agenda-back` e trigger
+`agenda-deploy-master` criados (`gcloud builds triggers describe agenda-deploy-master
+--region=southamerica-east1`). Verificar o primeiro disparo automático (`gcloud builds list
+--region=southamerica-east1 --limit=3`) depois do próximo push na `master` do remote
+`brikzai`.
 
 ## 9. Onboarding de tenant (banco já existe, criado pelo optin-service)
 
