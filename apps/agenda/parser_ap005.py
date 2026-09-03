@@ -24,6 +24,7 @@ Qualquer outra contagem é uma linha inválida.
 """
 import re
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 _NOME_ARQUIVO_RE = re.compile(r"^(CERC-AP005[AB]?)_(\d{8})_(\d{8})_(\d{7})_ret\.csv(\.gz)?$")
 _TIPOS_INFORMACAO_PAGAMENTO_VALIDOS = {"1", "2", "3", "4", "5", "6", "7", "8"}
@@ -74,15 +75,17 @@ def _campo(campos: list, indice: int, nome: str, *, obrigatorio: bool = True):
     return valor or None
 
 
-def _parse_decimal(campos: list, indice: int, nome: str, *, obrigatorio: bool, default=0):
+def _parse_decimal(campos: list, indice: int, nome: str, *, obrigatorio: bool, default=None):
+    """SPEC-04 §1: dinheiro é Decimal na aplicação, nunca float — evita
+    imprecisão binária antes do valor virar parâmetro do INSERT/UPDATE."""
     valor = _val(campos, indice)
     if not valor:
         if obrigatorio:
             raise LinhaInvalidaError(f"{nome} é obrigatório e veio vazio")
         return default
     try:
-        return float(valor)
-    except ValueError:
+        return Decimal(valor)
+    except InvalidOperation:
         raise LinhaInvalidaError(f"{nome} não é um decimal válido: {valor!r}") from None
 
 
@@ -164,8 +167,8 @@ def traduzir_linha(campos: list, tipo_leiaute: str):
         "documento_titular": _campo(campos, 6, "titular da UR (col. 7)"),
         "constituicao": _campo(campos, 7, "constituição da UR (col. 8)"),
         "valor_constituido_total": _parse_decimal(campos, 8, "valor constituído total (col. 9)", obrigatorio=True),
-        "valor_constituido_antecipacao_pre": _parse_decimal(campos, 9, "valor constituído antecipação pré (col. 10)", obrigatorio=False, default=0),
-        "valor_bloqueado": _parse_decimal(campos, 10, "valor bloqueado (col. 11)", obrigatorio=False, default=0),
+        "valor_constituido_antecipacao_pre": _parse_decimal(campos, 9, "valor constituído antecipação pré (col. 10)", obrigatorio=False, default=Decimal("0")),
+        "valor_bloqueado": _parse_decimal(campos, 10, "valor bloqueado (col. 11)", obrigatorio=False, default=Decimal("0")),
         "origem": "ARQUIVO",
         "origem_arquivo": tipo_leiaute,
     }
@@ -181,7 +184,7 @@ def traduzir_linha(campos: list, tipo_leiaute: str):
         pagamento = _traduzir_pagamento(bloco_12, tem_1216)
 
     cabecalho["carteira"] = _campo(cauda, 0, "carteira (col. 13)", obrigatorio=False)
-    cabecalho["valor_livre"] = _parse_decimal(cauda, 1, "valor livre (col. 14)", obrigatorio=False, default=0)
+    cabecalho["valor_livre"] = _parse_decimal(cauda, 1, "valor livre (col. 14)", obrigatorio=False, default=Decimal("0"))
     cabecalho["valor_total_ur"] = _parse_decimal(cauda, 2, "valor total da UR (col. 15)", obrigatorio=True)
     cabecalho["data_hora_ultima_atualizacao"] = _parse_data_hora(
         _campo(cauda, 3, "data/hora última atualização (col. 16)"), "data/hora última atualização (col. 16)",

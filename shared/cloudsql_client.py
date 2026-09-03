@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import threading
+from contextlib import contextmanager, nullcontext
 from typing import Any, List, Optional
 
 from shared.tenant_config import get_tenant_config
@@ -41,8 +42,9 @@ class ExecuteResult:
 
 
 class QueryBuilder:
-    def __init__(self, engine, table_name: str):
+    def __init__(self, engine, table_name: str, conn=None):
         self._engine = engine
+        self._conn = conn  # conexão/transação externa (db.transaction()) — quando setada, execute() participa dela em vez de abrir a sua própria
         self._table = table_name
         self._select_fields = "*"
         self._count_mode: Optional[str] = None
@@ -168,11 +170,20 @@ class QueryBuilder:
             result[k] = v
         return result
 
+    def _connection_for_read(self):
+        # Dentro de db.transaction(), reusa a MESMA conexão (nullcontext não a
+        # fecha nem comita ao sair — quem controla begin/commit/rollback é o
+        # `with db.transaction()` externo). Fora dela, comportamento de sempre.
+        return nullcontext(self._conn) if self._conn is not None else self._engine.connect()
+
+    def _connection_for_write(self):
+        return nullcontext(self._conn) if self._conn is not None else self._engine.begin()
+
     def _exec_select(self) -> ExecuteResult:
         from sqlalchemy import text
 
         where, params = self._build_where()
-        with self._engine.connect() as conn:
+        with self._connection_for_read() as conn:
             if self._count_mode == "exact":
                 sql = f"SELECT COUNT(*) FROM {self._table} {where}"
                 return ExecuteResult(data=[], count=conn.execute(text(sql), params).scalar())
@@ -193,7 +204,7 @@ class QueryBuilder:
 
         rows = self._insert_data if isinstance(self._insert_data, list) else [self._insert_data]
         inserted = []
-        with self._engine.begin() as conn:
+        with self._connection_for_write() as conn:
             for row in rows:
                 for col in row:
                     _validate_identifier(col, "coluna")
@@ -217,7 +228,7 @@ class QueryBuilder:
         where, where_params = self._build_where()
         params.update(where_params)
         sql = f"UPDATE {self._table} SET {set_clause} {where} RETURNING *"
-        with self._engine.begin() as conn:
+        with self._connection_for_write() as conn:
             result = conn.execute(text(sql), params)
             return ExecuteResult(data=[self._deserialize_row(dict(r._mapping)) for r in result])
 
@@ -227,18 +238,34 @@ class QueryBuilder:
         self._check_unfiltered()
         where, params = self._build_where()
         sql = f"DELETE FROM {self._table} {where} RETURNING *"
-        with self._engine.begin() as conn:
+        with self._connection_for_write() as conn:
             result = conn.execute(text(sql), params)
             return ExecuteResult(data=[self._deserialize_row(dict(r._mapping)) for r in result])
 
 
 class CloudSQLClient:
-    def __init__(self, engine):
+    def __init__(self, engine, conn=None):
         self._engine = engine
+        self._conn = conn  # setada só no client retornado por transaction()
 
     def table(self, name: str) -> QueryBuilder:
         _validate_identifier(name, "tabela")
-        return QueryBuilder(self._engine, name)
+        return QueryBuilder(self._engine, name, conn=self._conn)
+
+    @contextmanager
+    def transaction(self):
+        """Abre UMA conexão/transação e devolve um CloudSQLClient vinculado a
+        ela: todo `.table(...)` chamado a partir do client retornado
+        participa da MESMA transação, commitada ou desfeita inteira ao sair
+        do `with` (commit se o bloco terminar normalmente — inclusive via
+        `return` — ou levantar através dele; rollback se uma exceção
+        propagar). Existe porque upsert_agenda_ur faz várias escritas
+        (cabeçalho, eventos, pagamentos, limpeza de obsoletos) que precisam
+        ser tudo-ou-nada — antes desta função, cada QueryBuilder.execute()
+        abria sua própria transação, e uma falha no meio deixava escrita
+        parcial (achado da revisão comparativa com revvo-trade-agenda-processor)."""
+        with self._engine.begin() as conn:
+            yield CloudSQLClient(self._engine, conn=conn)
 
 
 def _create_engine(config: dict):

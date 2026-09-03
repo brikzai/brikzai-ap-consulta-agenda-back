@@ -1,0 +1,80 @@
+# Deploy do agenda-service (consulta de agenda) em Cloud Run.
+# Ordem: build → push → deploy do service.
+#
+# Diferente de ap-back-optin: não há Cloud Run Jobs nem passo de migration
+# automático aqui. Schema é aplicado manualmente, uma instância por vez, via
+# `python scripts/apply_schema.py sql/schema/NN-*.sql` (docs/runbooks/gcp-setup.md
+# seção 2) — mesma convenção que ap-back-contratos já usa, decisão do design
+# doc §6.
+#
+# Uso manual:
+#   gcloud builds submit --config cloudbuild.yaml --substitutions=_TAG=$(git rev-parse --short HEAD)
+#
+# Pré-requisitos: docs/runbooks/gcp-setup.md seções 1-4 (Artifact Registry,
+# schema+role no Cloud SQL compartilhado do optin, service accounts, segredos
+# estáticos) e ao menos um segredo AGENDA_TENANT_<cnpj>_CONFIG (seção 9).
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', '${_IMAGE}:${_TAG}', '.']
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '${_IMAGE}:${_TAG}']
+
+  - id: deploy-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}:${_TAG}
+      - --region=${_REGION}
+      - --platform=managed
+      # Público: o front chama do navegador (auth = JWT, shared/jwt_auth.py);
+      # os endpoints internos (/webhooks/agenda/processar, /jobs/*) são
+      # protegidos por OIDC na própria aplicação (shared/pubsub_auth.py),
+      # não pelo IAM do Cloud Run — não dá pra restringir só uma rota.
+      - --allow-unauthenticated
+      - --port=8080
+      - --cpu=1
+      - --memory=512Mi
+      - --concurrency=20
+      - --min-instances=0
+      - --max-instances=3
+      - --timeout=60
+      - --service-account=${_RUNTIME_SA}
+      # ^#^ troca o separador para '#' — '@' não serve porque
+      # PUBSUB_PUSH_INVOKER_SA é um e-mail de service account (tem '@'), e
+      # CORS_ALLOWED_ORIGINS tem vírgulas.
+      - --set-env-vars=^#^ENVIRONMENT=${_ENVIRONMENT}#GOOGLE_CLOUD_PROJECT=$PROJECT_ID#ALLOWED_HOSTS=*#CORS_ALLOWED_ORIGINS=${_CORS_ALLOWED_ORIGINS}#IAM_JWT_ISSUER=brikz-iam#CERC_AUTH_URL=${_CERC_AUTH_URL}#CERC_API_BASE_URL=${_CERC_API_BASE_URL}#WEB_CONCURRENCY=2#PUBSUB_TOPIC_AGENDA_WEBHOOK=${_PUBSUB_TOPIC}#PUBSUB_PUSH_AUDIENCE=${_PUBSUB_PUSH_AUDIENCE}#PUBSUB_PUSH_INVOKER_SA=${_RUNTIME_SA}
+      # DJANGO_SECRET_KEY tem prefixo AGENDA_ (evita colidir com o segredo do
+      # optin no mesmo projeto). IAM_JWT_PUBLIC_KEY é o MESMO segredo que
+      # ap-back-optin/ap-back-contratos já usam — mesmo IdP, mesma chave,
+      # nenhum segredo novo aqui (docs/runbooks/gcp-setup.md seção 4).
+      - --set-secrets=DJANGO_SECRET_KEY=AGENDA_DJANGO_SECRET_KEY:latest,IAM_JWT_PUBLIC_KEY=IAM_JWT_PUBLIC_KEY:latest
+
+substitutions:
+  _TAG: manual                     # passe _TAG=$(git rev-parse --short HEAD) no submit
+  _REGION: southamerica-east1
+  _SERVICE: agenda-service
+  _IMAGE: southamerica-east1-docker.pkg.dev/brikz-ap/agenda/agenda-service
+  _RUNTIME_SA: agenda-run@brikz-ap.iam.gserviceaccount.com
+  _ENVIRONMENT: homolog
+  # Origens do front autorizadas (vírgula). Atualize quando o ap-front tiver URL de homolog.
+  _CORS_ALLOWED_ORIGINS: http://localhost:5173
+  _CERC_AUTH_URL: https://api.int.cerc.com/oauth/token
+  _CERC_API_BASE_URL: https://ap-homolog.cerc.inf.br
+  _PUBSUB_TOPIC: agenda-webhook-inbox
+  # URL real do primeiro deploy (docs/runbooks/gcp-setup.md seção 8) — a
+  # mesma audiência protege os três endpoints internos (processar,
+  # varrer-completude, importar-ap005). Só muda se o serviço for recriado
+  # (URL nova) ou movido de região/projeto.
+  _PUBSUB_PUSH_AUDIENCE: https://agenda-service-6sy5bhymwq-rj.a.run.app/api/v1/webhooks/agenda/processar
+
+serviceAccount: projects/brikz-ap/serviceAccounts/agenda-build@brikz-ap.iam.gserviceaccount.com
+timeout: 1200s
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

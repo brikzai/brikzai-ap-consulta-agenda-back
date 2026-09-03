@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -107,3 +108,27 @@ def test_traduzir_linha_indicador_efeitos_contrato_vazio_vira_string_vazia():
     _, pagamento = parser_ap005.traduzir_linha(campos, "CERC-AP005")
     assert pagamento["indicador_efeitos_contrato"] == ""
     assert pagamento["indicador_efeitos_contrato"] is not None
+
+
+def test_traduzir_linha_valores_monetarios_sao_decimal_nao_float():
+    """SPEC-04 §1: 'Proibido float/double' também na aplicação, não só no
+    banco — o parser não pode introduzir imprecisão binária antes do INSERT."""
+    campos = _linha_completa(com_1216=True)
+    cabecalho, pagamento = parser_ap005.traduzir_linha(campos, "CERC-AP005")
+
+    assert isinstance(cabecalho["valor_constituido_total"], Decimal)
+    assert isinstance(cabecalho["valor_constituido_antecipacao_pre"], Decimal)
+    assert isinstance(cabecalho["valor_bloqueado"], Decimal)
+    assert isinstance(cabecalho["valor_livre"], Decimal)
+    assert isinstance(cabecalho["valor_total_ur"], Decimal)
+    assert cabecalho["valor_constituido_total"] == Decimal("1000.00")
+
+    assert isinstance(pagamento["valor_a_pagar"], Decimal)
+    assert pagamento["valor_a_pagar"] == Decimal("500.00")
+
+
+def test_parse_decimal_valor_invalido_levanta_linha_invalida():
+    campos = _linha_completa(com_1216=True)
+    campos[8] = "não-é-um-decimal"  # valor constituído total (col. 9)
+    with pytest.raises(parser_ap005.LinhaInvalidaError):
+        parser_ap005.traduzir_linha(campos, "CERC-AP005")

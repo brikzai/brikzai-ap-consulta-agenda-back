@@ -156,39 +156,47 @@ def _limpar_pagamentos_obsoletos(db, chave: dict, chaves_do_lote: set) -> None:
 
 
 def upsert_agenda_ur(financiador_id: str, cabecalho: dict, pagamentos: list) -> dict:
-    db = get_db(financiador_id)
+    """Todo-ou-nada: cabeçalho, eventos e pagamentos do lote são gravados
+    numa ÚNICA transação (shared.cloudsql_client.CloudSQLClient.transaction).
+    Antes desta função usar transaction(), cada escrita (upsert do cabeçalho,
+    cada evento, cada upsert de pagamento, a limpeza de obsoletos) abria sua
+    própria transação — uma falha no meio (ex.: ao gravar o 3º de 5
+    pagamentos) deixava a UR com cabeçalho atualizado e só parte dos
+    pagamentos gravados, sem rollback (achado da revisão comparativa com
+    revvo-trade-agenda-processor)."""
     chave = {campo: cabecalho[campo] for campo in _CHAVE_UR}
     origem = cabecalho["origem"]
     precedencia_origem(origem)  # valida cedo — erro claro se origem for inválida, em vez de um KeyError tardio num empate
     ocorrido_em = cabecalho["data_hora_ultima_atualizacao"]
 
-    existente = _buscar_um(db, "agenda_ur", chave, _CHAVE_UR)
-    criado = existente is None
-    if not _deve_sobrescrever(existente, ocorrido_em, origem):
-        return {"sobrescrito": False, "agenda_ur": existente, "pagamentos": [], "eventos": []}
+    with get_db(financiador_id).transaction() as db:
+        existente = _buscar_um(db, "agenda_ur", chave, _CHAVE_UR)
+        criado = existente is None
+        if not _deve_sobrescrever(existente, ocorrido_em, origem):
+            return {"sobrescrito": False, "agenda_ur": existente, "pagamentos": [], "eventos": []}
 
-    novo = _upsert_cabecalho(db, chave, cabecalho, existente, ocorrido_em)
-    eventos = _eventos_do_cabecalho(db, chave, origem, existente, novo, ocorrido_em)
+        novo = _upsert_cabecalho(db, chave, cabecalho, existente, ocorrido_em)
+        eventos = _eventos_do_cabecalho(db, chave, origem, existente, novo, ocorrido_em)
 
-    chaves_do_lote = set()
-    pagamentos_gravados = []
-    for pagamento in pagamentos:
-        gravado, chave_pagamento, liquidou_agora = _upsert_pagamento(db, chave, pagamento, ocorrido_em)
-        chaves_do_lote.add((
-            chave_pagamento["tipo_informacao_pagamento"],
-            chave_pagamento["indicador_efeitos_contrato"],
-        ))
-        pagamentos_gravados.append(gravado)
-        if liquidou_agora:
-            valor = gravado.get("valor_liquidacao_efetiva")
-            if valor is None:
-                valor = gravado.get("valor_a_pagar")
-            eventos.append(_registrar_evento(
-                db, chave, "LIQUIDACAO", origem, valor, ocorrido_em,
-                tipo_informacao_pagamento=chave_pagamento["tipo_informacao_pagamento"],
-                indicador_efeitos_contrato=chave_pagamento["indicador_efeitos_contrato"],
+        chaves_do_lote = set()
+        pagamentos_gravados = []
+        for pagamento in pagamentos:
+            gravado, chave_pagamento, liquidou_agora = _upsert_pagamento(db, chave, pagamento, ocorrido_em)
+            chaves_do_lote.add((
+                chave_pagamento["tipo_informacao_pagamento"],
+                chave_pagamento["indicador_efeitos_contrato"],
             ))
+            pagamentos_gravados.append(gravado)
+            if liquidou_agora:
+                valor = gravado.get("valor_liquidacao_efetiva")
+                if valor is None:
+                    valor = gravado.get("valor_a_pagar")
+                eventos.append(_registrar_evento(
+                    db, chave, "LIQUIDACAO", origem, valor, ocorrido_em,
+                    tipo_informacao_pagamento=chave_pagamento["tipo_informacao_pagamento"],
+                    indicador_efeitos_contrato=chave_pagamento["indicador_efeitos_contrato"],
+                ))
 
-    _limpar_pagamentos_obsoletos(db, chave, chaves_do_lote)
+        _limpar_pagamentos_obsoletos(db, chave, chaves_do_lote)
 
-    return {"sobrescrito": True, "agenda_ur": novo, "pagamentos": pagamentos_gravados, "eventos": eventos, "criado": criado}
+        return {"sobrescrito": True, "agenda_ur": novo, "pagamentos": pagamentos_gravados, "eventos": eventos, "criado": criado}

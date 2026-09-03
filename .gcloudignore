@@ -1,0 +1,21 @@
+# Controla o que `gcloud builds submit` envia como fonte do build (independente
+# do .dockerignore, que só controla o contexto do `docker build` já enviado).
+# Explícito em vez de depender do fallback (#!include:.gitignore) — mesmo padrão
+# de ap-back-optin (docs/runbooks/gcp-setup.md), mesmo este serviço não tendo
+# uma pasta keys/ própria hoje.
+.git
+.gitignore
+.claude
+.superpowers
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+*.pem
+**/*.pem
+keys/
+logs
+.env
+.env.*
+!.env.example

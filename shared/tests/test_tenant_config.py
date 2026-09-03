@@ -27,7 +27,7 @@ def test_get_tenant_config_le_e_parseia_json(monkeypatch):
     from shared.tenant_config import get_tenant_config
 
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv("TENANT_12345678000199_CONFIG", json.dumps(CONFIG_EXEMPLO))
+    monkeypatch.setenv("AGENDA_TENANT_12345678000199_CONFIG", json.dumps(CONFIG_EXEMPLO))
 
     assert get_tenant_config("12345678000199") == CONFIG_EXEMPLO
 
@@ -36,10 +36,10 @@ def test_get_tenant_config_usa_cache_sem_reler_env(monkeypatch):
     from shared.tenant_config import get_tenant_config
 
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv("TENANT_99999999000191_CONFIG", json.dumps(CONFIG_EXEMPLO))
+    monkeypatch.setenv("AGENDA_TENANT_99999999000191_CONFIG", json.dumps(CONFIG_EXEMPLO))
 
     primeira = get_tenant_config("99999999000191")
-    monkeypatch.delenv("TENANT_99999999000191_CONFIG", raising=False)
+    monkeypatch.delenv("AGENDA_TENANT_99999999000191_CONFIG", raising=False)
     segunda = get_tenant_config("99999999000191")
 
     assert primeira == segunda
@@ -49,7 +49,7 @@ def test_get_tenant_config_propaga_erro_quando_segredo_ausente(monkeypatch):
     from shared.tenant_config import get_tenant_config
 
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.delenv("TENANT_00000000000000_CONFIG", raising=False)
+    monkeypatch.delenv("AGENDA_TENANT_00000000000000_CONFIG", raising=False)
 
     with pytest.raises(RuntimeError):
         get_tenant_config("00000000000000")

@@ -14,7 +14,7 @@ from ulid import ULID
 from apps.agenda import parser_ap005
 from apps.agenda.correlacao import encontrar_consultas_candidatas
 from apps.agenda.importar_ap005 import importar_arquivo
-from apps.agenda.repository import _CHAVE_UR, _buscar_um, _como_datetime
+from apps.agenda.repository import _CHAVE_UR, _buscar_um, _com_filtros, _como_datetime
 from apps.agenda.repository import upsert_agenda_ur
 from apps.agenda.validation import ValidacaoConsultaError, validar_modos_permitidos
 from apps.agenda.validation import _FUSO_CONSULTA
@@ -126,18 +126,32 @@ def webhook_agenda(request, financiador_id: str):
     return JsonResponse({}, status=202)
 
 
+def _decimal(valor) -> Decimal:
+    """SPEC-04 §1: dinheiro é Decimal na aplicação, nunca float. O corpo do
+    webhook chega desserializado com `float` nativo do Python — este é o
+    ponto de tradução onde vira Decimal antes de alcançar upsert_agenda_ur.
+    `Decimal(str(v))`, não `Decimal(v)` direto: construir Decimal a partir do
+    float reproduz o binário exato dele (`Decimal(1000.33)` vira
+    `Decimal('1000.3299999999999954525264911353588104248046875')`); passar
+    por `str()` usa a representação decimal mais curta que o Python já
+    calcula para exibir o float — a mesma que corresponde ao literal JSON
+    original para qualquer valor monetário na faixa de grandeza deste
+    sistema (mesma técnica de services/cerc/client.py::_decimal)."""
+    return Decimal(str(valor)) if valor is not None else None
+
+
 def _traduzir_pagamento_webhook(pagamento: dict) -> dict:
     return {
         "tipo_informacao_pagamento": str(pagamento["tipoInformacaoPagamento"]),
         "indicador_efeitos_contrato": pagamento.get("indicadorEfeitosContrato"),
         "identificador_cerc_contrato": None,  # coluna 12.16 — só o Plano 08 (arquivo AP005) preenche
         "regras_divisao": pagamento.get("regrasDivisao"),
-        "valor_onerado": pagamento.get("valorOnerado"),
-        "valor_constituido_efeito": pagamento.get("valorConstituidoEfeito"),
-        "valor_a_pagar": pagamento.get("valorAPagar"),
+        "valor_onerado": _decimal(pagamento.get("valorOnerado")),
+        "valor_constituido_efeito": _decimal(pagamento.get("valorConstituidoEfeito")),
+        "valor_a_pagar": _decimal(pagamento.get("valorAPagar")),
         "beneficiario": pagamento.get("beneficiario"),
         "data_liquidacao_efetiva": pagamento.get("dataLiquidacaoEfetiva"),
-        "valor_liquidacao_efetiva": pagamento.get("valorLiquidacaoEfetiva"),
+        "valor_liquidacao_efetiva": _decimal(pagamento.get("valorLiquidacaoEfetiva")),
         "motivo_nao_pagamento": pagamento.get("motivoDeNaoPagamento"),
         "domicilio": pagamento.get("domicilioPagamento") or {},
     }
@@ -152,11 +166,11 @@ def _traduzir_evento_webhook(evento: dict) -> tuple:
         "documento_titular": evento["documentoTitular"],
         "data_liquidacao": evento["dataLiquidacao"],
         "constituicao": evento["constituicao"],
-        "valor_constituido_total": evento["valorConstituidoTotal"],
-        "valor_constituido_antecipacao_pre": evento.get("valorConstituidoAntecipacaoPre", 0),
-        "valor_bloqueado": evento.get("valorBloqueado", 0),
-        "valor_livre": evento.get("valorLivre", 0),
-        "valor_total_ur": evento["valorTotalUR"],
+        "valor_constituido_total": _decimal(evento["valorConstituidoTotal"]),
+        "valor_constituido_antecipacao_pre": _decimal(evento.get("valorConstituidoAntecipacaoPre", 0)),
+        "valor_bloqueado": _decimal(evento.get("valorBloqueado", 0)),
+        "valor_livre": _decimal(evento.get("valorLivre", 0)),
+        "valor_total_ur": _decimal(evento["valorTotalUR"]),
         "carteira": evento.get("carteira"),
         "data_hora_ultima_atualizacao": datetime.fromisoformat(evento["dataHoraUltimaAtualizacao"].replace("Z", "+00:00")),
         "origem": "WEBHOOK",
@@ -257,7 +271,7 @@ def processar_webhook_agenda(request):
     return JsonResponse({}, status=204)
 
 
-_TENANTS_JOBS_PERIODICOS = ["12345678000199"]  # lista fixa — design doc §14 ponto 3, não resolvido ainda
+_TENANTS_JOBS_PERIODICOS = ["38138785000136"]  # lista fixa — design doc §14 ponto 3, não resolvido ainda; CNPJ do tenant provisionado em homolog (docs/runbooks/gcp-setup.md)
 _QUIET_PERIOD_SEGUNDOS = 90
 _HARD_TIMEOUT_SEGUNDOS = 15 * 60
 
@@ -823,6 +837,72 @@ def posicao_urs(request):
     except Exception:
         logger.exception("[AgendasUrsPosicao] Falha inesperada (financiador=%s)", request.financiador_id)
         return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao calcular posição"}, status=500)
+
+
+_CAMPOS_OBRIGATORIOS_PAGAMENTOS_UR = (
+    "entidadeRegistradora", "credenciadora", "ufr", "titular", "arranjo", "dataLiquidacao",
+)
+
+
+def _serializar_pagamento(pagamento: dict) -> dict:
+    return {
+        "tipoInformacaoPagamento": pagamento["tipo_informacao_pagamento"],
+        "indicadorEfeitosContrato": pagamento["indicador_efeitos_contrato"],
+        "identificadorCercContrato": pagamento["identificador_cerc_contrato"],
+        "regrasDivisao": pagamento["regras_divisao"],
+        "valorOnerado": pagamento["valor_onerado"],
+        "valorConstituidoEfeito": pagamento["valor_constituido_efeito"],
+        "valorAPagar": pagamento["valor_a_pagar"],
+        "beneficiario": pagamento["beneficiario"],
+        "dataLiquidacaoEfetiva": pagamento["data_liquidacao_efetiva"].isoformat() if pagamento["data_liquidacao_efetiva"] else None,
+        "valorLiquidacaoEfetiva": pagamento["valor_liquidacao_efetiva"],
+        "motivoNaoPagamento": pagamento["motivo_nao_pagamento"],
+        "domicilio": pagamento["domicilio"],
+    }
+
+
+@jwt_required
+@require_GET
+def pagamentos_ur(request):
+    """GET /api/v1/agendas/urs/pagamentos — detalhe dos pagamentos/efeitos
+    (agenda_ur_pagamento) de UMA UR, identificada pela sua chave natural via
+    query params — os mesmos 6 campos que listar_urs já devolve em cada
+    linha (entidadeRegistradora, credenciadora, ufr, titular, arranjo,
+    dataLiquidacao). Não usa `agenda_ur.sequencia` como identificador: é um
+    cursor de paginação interno, deliberadamente não exposto pela API
+    (ver test_views_listar_urs.py::test_lista_filtrada_por_ufr). Repositório
+    consolidado, não chama a CERC. Lista vazia é resultado válido (UR
+    "baixada sem pagamentos a fazer", SPEC03 §6.2) — nunca erro."""
+    faltando = [c for c in _CAMPOS_OBRIGATORIOS_PAGAMENTOS_UR if not request.GET.get(c)]
+    if faltando:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": f"parâmetros obrigatórios ausentes: {', '.join(faltando)}"},
+            status=400,
+        )
+
+    try:
+        data_liquidacao = _parse_data_iso(request.GET.get("dataLiquidacao"), "dataLiquidacao")
+    except ValueError as exc:
+        return JsonResponse({"erro": "PARAMETRO_INVALIDO", "mensagem": str(exc)}, status=400)
+
+    chave = {
+        "entidade_registradora": request.GET["entidadeRegistradora"],
+        "cnpj_credenciadora": request.GET["credenciadora"],
+        "documento_ufr": request.GET["ufr"],
+        "documento_titular": request.GET["titular"],
+        "codigo_arranjo": request.GET["arranjo"],
+        "data_liquidacao": data_liquidacao,
+    }
+
+    try:
+        db = get_db(request.financiador_id)
+        pagamentos = _com_filtros(
+            db.table("agenda_ur_pagamento").select("*"), chave, _CHAVE_UR,
+        ).execute().data
+        return JsonResponse({"pagamentos": [_serializar_pagamento(p) for p in pagamentos]}, status=200)
+    except Exception:
+        logger.exception("[AgendasUrsPagamentos] Falha inesperada (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao listar pagamentos"}, status=500)
 
 
 def _serializar_consulta_compliance(consulta: dict) -> dict:

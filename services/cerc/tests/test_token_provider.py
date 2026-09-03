@@ -14,7 +14,7 @@ FINANCIADOR_TESTE = "12345678000199"
 def _reset_cache_and_env(monkeypatch):
     monkeypatch.setenv("CERC_AUTH_URL", "https://api.int.cerc.com/oauth/token")
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+    monkeypatch.setenv(f"AGENDA_TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
         "cerc_client_id": "client-123",
         "cerc_client_secret": "segredo-local",
     }))
@@ -25,6 +25,27 @@ def _reset_cache_and_env(monkeypatch):
     tenant_config_module._cache.clear()
     yield
     tenant_config_module._cache.clear()
+
+
+@respx.mock
+def test_fetch_token_usa_basic_auth_nao_body():
+    """A CERC exige client_id/client_secret via HTTP Basic Auth (header
+    Authorization), não como parâmetros no corpo — achado ao testar contra
+    homolog real (docs/runbooks/gcp-setup.md): com as credenciais só no
+    body a CERC responde 401."""
+    route = respx.post("https://api.int.cerc.com/oauth/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+    )
+
+    token_provider.get_cerc_token(FINANCIADOR_TESTE)
+
+    enviado = route.calls[0].request
+    auth_header = enviado.headers.get("authorization", "")
+    assert auth_header.lower().startswith("basic ")
+    corpo = enviado.content.decode("utf-8")
+    assert "client_id" not in corpo
+    assert "client_secret" not in corpo
+    assert "segredo-local" not in corpo
 
 
 @respx.mock
@@ -160,7 +181,7 @@ def test_fetch_token_nao_mantem_client_secret_no_frame_apos_erro():
 
 
 def test_fetch_token_sanitiza_config_sem_client_secret(monkeypatch):
-    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+    monkeypatch.setenv(f"AGENDA_TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
         "cerc_client_id": "client-123",
     }))
 
@@ -180,7 +201,7 @@ def test_fetch_token_sanitiza_config_sem_client_secret(monkeypatch):
 
 
 def test_fetch_token_sanitiza_config_sem_client_id(monkeypatch):
-    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+    monkeypatch.setenv(f"AGENDA_TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
         "cerc_client_secret": "segredo-orfao",
     }))
 
@@ -200,7 +221,7 @@ def test_fetch_token_sanitiza_config_sem_client_id(monkeypatch):
 
 
 def test_fetch_token_nao_mantem_config_no_frame_apos_chave_ausente(monkeypatch):
-    monkeypatch.setenv(f"TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
+    monkeypatch.setenv(f"AGENDA_TENANT_{FINANCIADOR_TESTE}_CONFIG", json.dumps({
         "cerc_client_id": "client-123",
     }))
 
@@ -227,7 +248,7 @@ def test_fetch_token_nao_mantem_config_no_frame_apos_chave_ausente(monkeypatch):
 
 @respx.mock
 def test_get_cerc_token_isola_cache_entre_tenants(monkeypatch):
-    monkeypatch.setenv("TENANT_99999999000191_CONFIG", json.dumps({
+    monkeypatch.setenv("AGENDA_TENANT_99999999000191_CONFIG", json.dumps({
         "cerc_client_id": "client-999",
         "cerc_client_secret": "outro-segredo",
     }))

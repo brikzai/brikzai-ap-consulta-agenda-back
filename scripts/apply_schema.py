@@ -50,8 +50,12 @@ def _create_engine():
 
 
 def _ledger_table_exists(conn) -> bool:
+    # Sem qualificar com o schema: resolve pelo search_path da conexão —
+    # cai em "public" numa instância dedicada, ou no schema do tenant
+    # (ex.: "agenda") quando o usuário de conexão tem search_path próprio,
+    # caso de instância Cloud SQL compartilhada com outro serviço irmão.
     result = conn.exec_driver_sql(
-        "SELECT to_regclass('public.schema_aplicado') IS NOT NULL"
+        "SELECT to_regclass('schema_aplicado') IS NOT NULL"
     )
     return bool(result.scalar())
 

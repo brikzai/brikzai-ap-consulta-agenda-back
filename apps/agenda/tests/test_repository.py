@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from shared.cloudsql_client import get_db
+from apps.agenda import repository
 from apps.agenda.repository import (
     _CHAVE_UR,
     _com_filtros,
@@ -261,3 +262,30 @@ def test_upsert_origem_invalida_falha_rapido():
     t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
     with pytest.raises(KeyError):
         upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "sincrono"), pagamentos=[])
+
+
+def test_upsert_e_atomico_nao_deixa_escrita_parcial_quando_falha_no_meio(monkeypatch):
+    """Prova a correção de atomicidade: upsert_agenda_ur passou a rodar
+    dentro de get_db(...).transaction() (shared/cloudsql_client.py), então
+    uma falha após o cabeçalho já ter sido inserido (aqui, simulada no
+    primeiro _registrar_evento — o evento CAPTURA da criação) precisa
+    desfazer TAMBÉM o INSERT do cabeçalho, não só deixar de gravar o resto."""
+    t1 = datetime(2026, 9, 10, 10, 0, tzinfo=timezone.utc)
+
+    def _registrar_evento_com_falha(*args, **kwargs):
+        raise RuntimeError("falha simulada no meio do upsert")
+
+    monkeypatch.setattr(repository, "_registrar_evento", _registrar_evento_com_falha)
+
+    with pytest.raises(RuntimeError, match="falha simulada"):
+        upsert_agenda_ur(FINANCIADOR_TESTE, _cabecalho(t1, "SINCRONO"), pagamentos=[_pagamento("1")])
+
+    ur_persistida = _com_filtros(
+        get_db(FINANCIADOR_TESTE).table("agenda_ur").select("*"), CHAVE_TESTE, _CHAVE_UR,
+    ).execute().data
+    assert ur_persistida == []  # o INSERT do cabeçalho, que rodou ANTES da falha, também foi desfeito
+
+    pagamentos_persistidos = _com_filtros(
+        get_db(FINANCIADOR_TESTE).table("agenda_ur_pagamento").select("*"), CHAVE_TESTE, _CHAVE_UR,
+    ).execute().data
+    assert pagamentos_persistidos == []

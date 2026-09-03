@@ -115,6 +115,51 @@ def _resposta_cerc(titulares=None, **overrides_ur):
 
 
 @respx.mock
+def test_consultar_agenda_aceita_resposta_embrulhada_em_agendas():
+    """SPEC03 §4.3 documenta um array puro, mas a CERC de homologação
+    devolve {"agendas": [...], "documentoUsuarioFinalRecebedor": ...} na
+    prática — achado ao testar contra o ambiente real
+    (docs/runbooks/gcp-setup.md). documentoUsuarioFinalRecebedor vem uma
+    vez no envelope, não repetido em cada item de "agendas"."""
+    agenda_sem_documento = _resposta_cerc()[0]
+    del agenda_sem_documento["documentoUsuarioFinalRecebedor"]
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(
+        200,
+        json={"agendas": [agenda_sem_documento], "documentoUsuarioFinalRecebedor": CNPJ_VALIDO},
+    ))
+
+    resultado = client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(modo="BATCH"))
+
+    assert resultado["status"] == "COMPLETA"
+    assert len(resultado["agendas"]) == 1
+
+    db = get_db(FINANCIADOR_TESTE)
+    ur_gravada = repository._com_filtros(db.table("agenda_ur").select("*"), CHAVE_UR_TESTE, repository._CHAVE_UR).execute().data
+    assert len(ur_gravada) == 1
+
+
+@respx.mock
+def test_consultar_agenda_sem_data_hora_ultima_atualizacao_usa_agora():
+    """SPEC03 §4.3 documenta dataHoraUltimaAtualizacao por titular, mas a
+    resposta síncrona real da CERC de homologação não traz esse campo
+    (achado ao testar contra o ambiente real, docs/runbooks/gcp-setup.md)
+    — sem ele, "agora" é o dado mais fresco que temos."""
+    titulares = [_titular(CNPJ_VALIDO, 1000.0, dataHoraUltimaAtualizacao=None)]
+    respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc(titulares=titulares)))
+
+    antes = datetime.now(timezone.utc)
+    resultado = client.consultar_agenda(FINANCIADOR_TESTE, _consulta_base(modo="BATCH"))
+    depois = datetime.now(timezone.utc)
+
+    assert resultado["status"] == "COMPLETA"
+    db = get_db(FINANCIADOR_TESTE)
+    ur_gravada = repository._com_filtros(db.table("agenda_ur").select("*"), CHAVE_UR_TESTE, repository._CHAVE_UR).execute().data
+    assert len(ur_gravada) == 1
+    gravado_em = repository._como_datetime(ur_gravada[0]["data_hora_ultima_atualizacao"])
+    assert antes <= gravado_em <= depois
+
+
+@respx.mock
 def test_consultar_agenda_batch_persiste_ur_e_fecha_completa():
     respx.post(URL_CONSULTAR).mock(return_value=httpx.Response(200, json=_resposta_cerc()))
 

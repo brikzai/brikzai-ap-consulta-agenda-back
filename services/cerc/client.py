@@ -23,6 +23,7 @@ Mapeamento de erros CERC (catálogo 105xxx, SPEC03 §10):
 import os
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import httpx
 from ulid import ULID
@@ -150,6 +151,21 @@ def _chamar_cerc(financiador_id: str, consulta: dict, *, online: bool, tentativa
     if response.status_code == 200:
         if corpo_resposta is None:
             return []
+        # SPEC03 §4.3 documenta um array puro; a CERC de homologação
+        # devolve {"agendas": [...], "documentoUsuarioFinalRecebedor": ...,
+        # ...} na prática (achado ao testar contra o ambiente real,
+        # docs/runbooks/gcp-setup.md) — aceita os dois. documentoUsuarioFinalRecebedor
+        # vem uma vez no envelope, não repetido em cada item de "agendas",
+        # mas _traduzir_ur espera achá-lo em cada item (agenda["documentoUsuarioFinalRecebedor"]) —
+        # propaga pra baixo antes de devolver.
+        if isinstance(corpo_resposta, dict) and isinstance(corpo_resposta.get("agendas"), list):
+            documento_ufr = corpo_resposta.get("documentoUsuarioFinalRecebedor")
+            agendas_lista = corpo_resposta["agendas"]
+            if documento_ufr:
+                for item in agendas_lista:
+                    if isinstance(item, dict):
+                        item.setdefault("documentoUsuarioFinalRecebedor", documento_ufr)
+            corpo_resposta = agendas_lista
         if not isinstance(corpo_resposta, list):
             raise CercConsultaInvalidaError("FORMATO_INESPERADO", "resposta 200 da CERC não é uma lista de agendas")
         return corpo_resposta
@@ -161,18 +177,31 @@ def _parse_data_hora(valor: str) -> datetime:
     return datetime.fromisoformat(valor.replace("Z", "+00:00"))
 
 
+def _decimal(valor) -> Decimal:
+    """SPEC-04 §1: dinheiro é Decimal na aplicação, nunca float. `httpx`
+    desserializa a resposta JSON da CERC com `float` nativo do Python — este
+    ponto de tradução é onde isso vira Decimal antes de alcançar upsert_agenda_ur.
+    `Decimal(str(v))` (não `Decimal(v)`) porque construir Decimal direto de um
+    float reproduz o binário exato do float (`Decimal(1000.33)` vira
+    `Decimal('1000.3299999999999954525264911353588104248046875')`) — passar
+    por `str()` usa a representação decimal mais curta que o Python já
+    calcula para exibir o float, que é a que corresponde ao literal JSON
+    original para qualquer valor monetário nesta faixa de grandeza."""
+    return Decimal(str(valor)) if valor is not None else None
+
+
 def _traduzir_pagamento(pagamento: dict) -> dict:
     return {
         "tipo_informacao_pagamento": str(pagamento["tipoInformacaoPagamento"]),
         "indicador_efeitos_contrato": pagamento.get("indicadorEfeitosContrato"),
         "identificador_cerc_contrato": None,  # coluna 12.16 — só o Plano 08 (arquivo AP005) preenche
         "regras_divisao": pagamento.get("regrasDivisao"),
-        "valor_onerado": pagamento.get("valorOnerado"),
-        "valor_constituido_efeito": pagamento.get("valorConstituidoEfeito"),
-        "valor_a_pagar": pagamento.get("valorAPagar"),
+        "valor_onerado": _decimal(pagamento.get("valorOnerado")),
+        "valor_constituido_efeito": _decimal(pagamento.get("valorConstituidoEfeito")),
+        "valor_a_pagar": _decimal(pagamento.get("valorAPagar")),
         "beneficiario": pagamento.get("beneficiario"),
         "data_liquidacao_efetiva": pagamento.get("dataLiquidacaoEfetiva"),
-        "valor_liquidacao_efetiva": pagamento.get("valorLiquidacaoEfetiva"),
+        "valor_liquidacao_efetiva": _decimal(pagamento.get("valorLiquidacaoEfetiva")),
         "motivo_nao_pagamento": pagamento.get("motivoDeNaoPagamento"),
         "domicilio": pagamento.get("domicilioPagamento") or {},
     }
@@ -192,13 +221,23 @@ def _traduzir_ur(agenda: dict, ur: dict) -> list:
             "documento_titular": titular["documentoTitular"],
             "data_liquidacao": ur["dataLiquidacao"],
             "constituicao": ur["constituicao"],
-            "valor_constituido_total": titular["valorConstituidoTotal"],
-            "valor_constituido_antecipacao_pre": titular.get("valorConstituidoAntecipacaoPre", 0),
-            "valor_bloqueado": titular.get("valorBloqueado", 0),
-            "valor_livre": titular.get("valorLivre", 0),
-            "valor_total_ur": ur["valorTotalUR"],
+            "valor_constituido_total": _decimal(titular["valorConstituidoTotal"]),
+            "valor_constituido_antecipacao_pre": _decimal(titular.get("valorConstituidoAntecipacaoPre", 0)),
+            "valor_bloqueado": _decimal(titular.get("valorBloqueado", 0)),
+            "valor_livre": _decimal(titular.get("valorLivre", 0)),
+            "valor_total_ur": _decimal(ur["valorTotalUR"]),
             "carteira": ur.get("carteira"),
-            "data_hora_ultima_atualizacao": _parse_data_hora(titular["dataHoraUltimaAtualizacao"]),
+            # SPEC03 §4.3 documenta dataHoraUltimaAtualizacao por titular,
+            # mas a resposta síncrona real da CERC de homologação não traz
+            # esse campo (achado ao testar contra o ambiente real,
+            # docs/runbooks/gcp-setup.md) — na ausência, "agora" É o dado
+            # mais fresco que temos: acabamos de buscar isto síncrona e
+            # onlinemente na própria CERC.
+            "data_hora_ultima_atualizacao": (
+                _parse_data_hora(titular["dataHoraUltimaAtualizacao"])
+                if titular.get("dataHoraUltimaAtualizacao")
+                else datetime.now(timezone.utc)
+            ),
             "origem": "SINCRONO",
             "origem_arquivo": None,
         }

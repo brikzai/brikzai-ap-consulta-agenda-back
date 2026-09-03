@@ -59,13 +59,14 @@ def _fetch_token(financiador_id: str) -> dict:
         finally:
             del config
         try:
+            # client_id/client_secret via HTTP Basic Auth (header
+            # Authorization: Basic base64(id:secret)), não no corpo — é o
+            # que a CERC exige (client_credentials RFC 6749 §2.3.1); com
+            # as credenciais só no body ela responde 401 sem mais detalhe.
             response = httpx.post(
                 os.environ["CERC_AUTH_URL"],
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                },
+                data={"grant_type": "client_credentials"},
+                auth=(client_id, client_secret),
                 timeout=10.0,
             )
             response.raise_for_status()
