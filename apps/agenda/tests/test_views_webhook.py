@@ -111,6 +111,55 @@ def test_webhook_valido_persiste_no_inbox_e_publica(publicados):
         _limpar(envelope)
 
 
+def test_webhook_envelope_embrulhado_em_array_funciona_igual(publicados):
+    """SPEC03 §5.2 documenta o envelope como objeto solto, mas o teste real
+    de conectividade do portal da CERC manda embrulhado num array de 1
+    elemento (achado em 2026-09-04, docs/runbooks/gcp-setup.md)."""
+    envelope = _envelope("11222333000181")
+    _limpar(envelope)
+    try:
+        response = Client().post(
+            URL, data=json.dumps([envelope]), content_type="application/json",
+            HTTP_AUTHORIZATION=_basic_auth_header(),
+        )
+        assert response.status_code == 202
+
+        h = hash_evento(envelope["tipoEvento"], envelope["evento"], envelope["dataHoraEvento"])
+        salvo = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("hash_dedupe", h).execute()
+        assert len(salvo.data) == 1
+    finally:
+        _limpar(envelope)
+
+
+def test_webhook_testecerc_sem_evento_retorna_202(publicados):
+    """testeCerc (SPEC01 §4.4) é o ping de conectividade da CERC — não
+    carrega "evento", confirmado no teste real do portal em 2026-09-04.
+    Qualquer outro tipoEvento continua exigindo os três campos."""
+    envelope = {"tipoEvento": "testeCerc", "dataHoraEvento": "2026-09-04T21:12:41.97572909"}
+    h = hash_evento(envelope["tipoEvento"], None, envelope["dataHoraEvento"])
+    get_db(FINANCIADOR_TESTE).table("webhook_inbox").delete().eq("hash_dedupe", h).execute()
+    try:
+        response = Client().post(
+            URL, data=json.dumps([envelope]), content_type="application/json",
+            HTTP_AUTHORIZATION=_basic_auth_header(),
+        )
+        assert response.status_code == 202
+
+        salvo = get_db(FINANCIADOR_TESTE).table("webhook_inbox").select("*").eq("hash_dedupe", h).execute()
+        assert len(salvo.data) == 1
+        assert salvo.data[0]["tipo_evento"] == "testeCerc"
+    finally:
+        get_db(FINANCIADOR_TESTE).table("webhook_inbox").delete().eq("hash_dedupe", h).execute()
+
+
+def test_webhook_testecerc_sem_datahoraevento_retorna_400():
+    response = Client().post(
+        URL, data=json.dumps({"tipoEvento": "testeCerc"}), content_type="application/json",
+        HTTP_AUTHORIZATION=_basic_auth_header(),
+    )
+    assert response.status_code == 400
+
+
 def test_webhook_duplicado_nao_gera_segunda_linha_nem_publica_de_novo(publicados):
     envelope = _envelope("11222333000181")
     _limpar(envelope)

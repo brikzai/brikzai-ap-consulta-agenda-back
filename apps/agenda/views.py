@@ -85,14 +85,28 @@ def webhook_agenda(request, financiador_id: str):
         return JsonResponse({"erro": "autenticação inválida"}, status=401)
 
     try:
-        envelope = json.loads(request.body)
+        corpo = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"erro": "corpo não é JSON válido"}, status=400)
+
+    # SPEC03 §5.2 documenta o envelope como objeto solto; o teste de
+    # conectividade real do portal da CERC manda embrulhado num array de 1
+    # elemento (achado em 2026-09-04, ver docs/runbooks/gcp-setup.md) —
+    # aceita os dois formatos.
+    envelope = corpo[0] if isinstance(corpo, list) and corpo else corpo
 
     tipo_evento = envelope.get("tipoEvento") if isinstance(envelope, dict) else None
     data_hora_evento = envelope.get("dataHoraEvento") if isinstance(envelope, dict) else None
     evento = envelope.get("evento") if isinstance(envelope, dict) else None
-    if not tipo_evento or not data_hora_evento or evento is None:
+
+    # testeCerc (SPEC01 §4.4): ping de conectividade da CERC, sem UR real
+    # — não carrega "evento". Confirmado em 2026-09-04: o teste do portal
+    # manda só tipoEvento+dataHoraEvento. Para qualquer outro tipoEvento
+    # (em particular "agenda"), os três campos continuam obrigatórios.
+    if tipo_evento == "testeCerc":
+        if not data_hora_evento:
+            return JsonResponse({"erro": "envelope inválido: dataHoraEvento é obrigatório"}, status=400)
+    elif not tipo_evento or not data_hora_evento or evento is None:
         return JsonResponse(
             {"erro": "envelope inválido: tipoEvento, dataHoraEvento e evento são obrigatórios"}, status=400,
         )
@@ -837,6 +851,90 @@ def posicao_urs(request):
     except Exception:
         logger.exception("[AgendasUrsPosicao] Falha inesperada (financiador=%s)", request.financiador_id)
         return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao calcular posição"}, status=500)
+
+
+def _filtros_totais_urs(query, ufr: str, credenciadora, arranjo):
+    query = query.eq("documento_ufr", ufr)
+    if credenciadora:
+        query = query.eq("cnpj_credenciadora", credenciadora)
+    if arranjo:
+        query = query.eq("codigo_arranjo", arranjo)
+    return query
+
+
+@jwt_required
+@require_GET
+def totais_urs(request):
+    """GET /api/v1/agendas/urs/totais — 4 totalizadores fixos pro topo da
+    tela de agenda (design doc §10, sem número de plano — pedido direto do
+    front). Diferente de posicao_urs (que exige uma janela de
+    dataLiquidacao escolhida pelo chamador): aqui não há parâmetro de
+    janela — cada campo tem sua própria semântica de tempo, fixa:
+
+    - bloqueado/disponivel: soma de TODAS as URs constituídas do UFR
+      (passado + futuro, sem filtro de data) — descrevem o estado ATUAL
+      da UR (bloqueada pra oneração ou livre pra uso), não uma previsão
+      de quando liquida. Custo: SUM(...) WHERE documento_ufr=X usa o
+      índice (documento_ufr, data_liquidacao) INCLUDE (...) já existente
+      como index-only scan — proporcional às URs desse UFR, não ao
+      tamanho da tabela inteira.
+    - liquidadoHoje: soma de valor_liquidacao_efetiva (agenda_ur_pagamento)
+      confirmado HOJE (calendário America/Sao_Paulo, mesma convenção de
+      apps.agenda.validation._FUSO_CONSULTA) — confirmação real de
+      pagamento, não a data agendada (agenda_ur.data_liquidacao).
+    - totalALiquidar: total constituído MENOS tudo que já foi confirmado
+      como liquidado (valor_liquidacao_efetiva) em qualquer data — "o que
+      falta pagar de verdade", não uma soma de valor_total_ur (que
+      duplicaria UR com múltiplos titulares, já que valor_total_ur se
+      repete por titular — mesma ressalva de posicao_urs/§4.5).
+
+    valorFumaca (constituicao='2') nunca entra em nenhum dos quatro,
+    mesma convenção de posicao_urs.
+    """
+    ufr = request.GET.get("ufr")
+    if not ufr:
+        return JsonResponse(
+            {"erro": "CAMPO_OBRIGATORIO_AUSENTE", "mensagem": "parâmetro obrigatório ausente: ufr"}, status=400,
+        )
+    credenciadora = request.GET.get("credenciadora")
+    arranjo = request.GET.get("arranjo")
+    hoje = datetime.now(_FUSO_CONSULTA).date()
+
+    try:
+        db = get_db(request.financiador_id)
+
+        posicao = _filtros_totais_urs(
+            db.table("agenda_ur").select(
+                "COALESCE(SUM(valor_bloqueado),0) AS bloqueado, "
+                "COALESCE(SUM(valor_livre),0) AS livre, "
+                "COALESCE(SUM(valor_constituido_total),0) AS constituido"
+            ).eq("constituicao", "1"),
+            ufr, credenciadora, arranjo,
+        ).execute().data[0]
+
+        liquidado_hoje = _filtros_totais_urs(
+            db.table("agenda_ur_pagamento").select(
+                "COALESCE(SUM(valor_liquidacao_efetiva),0) AS total"
+            ).eq("data_liquidacao_efetiva", hoje),
+            ufr, credenciadora, arranjo,
+        ).execute().data[0]["total"]
+
+        liquidado_total = _filtros_totais_urs(
+            db.table("agenda_ur_pagamento").select(
+                "COALESCE(SUM(valor_liquidacao_efetiva),0) AS total"
+            ),
+            ufr, credenciadora, arranjo,
+        ).execute().data[0]["total"]
+
+        return JsonResponse({
+            "bloqueado": posicao["bloqueado"],
+            "disponivel": posicao["livre"],
+            "liquidadoHoje": liquidado_hoje,
+            "totalALiquidar": posicao["constituido"] - liquidado_total,
+        }, status=200)
+    except Exception:
+        logger.exception("[AgendasUrsTotais] Falha inesperada (financiador=%s)", request.financiador_id)
+        return JsonResponse({"erro": "ERRO_INTERNO", "mensagem": "falha inesperada ao calcular totais"}, status=500)
 
 
 _CAMPOS_OBRIGATORIOS_PAGAMENTOS_UR = (
