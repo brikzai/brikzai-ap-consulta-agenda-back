@@ -417,3 +417,39 @@ agenda-service.
 
 **agenda-service em homolog está no ar e servindo tráfego real:**
 `https://agenda-service-6sy5bhymwq-rj.a.run.app`
+
+## 12. Cadastro do canal de webhook na CERC (2026-09-04/05) — 3 bugs achados e corrigidos
+
+Testando o cadastro real do canal de webhook (`tipoEvento=agenda`) no portal de homologação
+da CERC, 3 problemas reais, nenhum pego pelos testes unitários (que mockam o formato
+documentado na SPEC, que diverge do real):
+
+1. **Header de auth mal formado no canal.** O campo "Header" do portal da CERC é texto livre
+   (`Nome, Valor`), não usuário/senha separados — foi preenchido só com a senha crua
+   (`basic <senha>`), sem usuário nem Base64. Corrigido: valor certo é
+   `Authorization, Basic base64(usuario:senha)`. Sintoma: `401`, log de diagnóstico mostrava
+   "sem Basic Auth — esquema recebido: (ausente)" (a CERC nem mandava header reconhecível).
+2. **Envelope embrulhado em array.** SPEC03 §5.2 documenta objeto solto; a CERC manda
+   `[{...}]`. Corrigido em `webhook_agenda` (aceita os dois formatos).
+3. **`tipoEvento=testeCerc` sem o campo `evento`.** É o ping de conectividade (SPEC01 §4.4)
+   — não carrega UR real. Corrigido: só exige `dataHoraEvento` nesse caso; `agenda` e demais
+   tipos continuam exigindo os três campos.
+
+Cada um confirmado com log de diagnóstico temporário (nunca logou senha, só forma do header
+e corpo bruto do evento) e removido do código depois de confirmado — ver histórico de commits
+`fix: pass --timeout...` em diante.
+
+**Pendência aberta, não resolvida:** depois dos 3 fixes acima, o botão "testar webhook" do
+portal da CERC continuou reportando `400` (o mesmo erro de antes do fix). Confirmado
+repetidas vezes, inclusive em aba anônima, que **nenhuma requisição nova chega no nosso
+servidor** quando esse botão é clicado (log do Cloud Run sem nenhum hit em
+`/webhooks/agenda/` nos minutos seguintes ao clique) — testado diretamente com `curl`
+simulando o payload real, sempre `202`. Hipótese mais provável: o botão de teste do portal
+da CERC reexibe o resultado da primeira tentativa (de antes dos fixes) em vez de refazer a
+chamada. Repassado pra CERC com essa evidência.
+
+**Teste alternativo (consulta online real, dispara o webhook de verdade por trás):**
+tentativa em 2026-09-05 ~21h (horário local) devolveu `105998 FORA DA JANELA DE
+PROCESSAMENTO` — CERC de homologação não processa consulta online fora do horário comercial.
+Repetir em horário comercial (dia útil) e conferir se `webhook_inbox` recebe o evento real
+(`tipoEvento=agenda`) dessa vez.
