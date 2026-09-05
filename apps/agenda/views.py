@@ -84,14 +84,10 @@ def webhook_agenda(request, financiador_id: str):
     if not _autenticado(request, financiador_id):
         return JsonResponse({"erro": "autenticação inválida"}, status=401)
 
-    # DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar o teste no portal
-    # da CERC, 2026-09-05): corpo bruto não tem segredo nenhum.
-    logger.warning("[Webhook][diag2] financiador=%s corpo bruto: %r", financiador_id, request.body[:2000])
-
     try:
         corpo = json.loads(request.body)
     except json.JSONDecodeError:
-        logger.warning("[Webhook][diag2] financiador=%s corpo não é JSON válido", financiador_id)
+        logger.warning("[Webhook] Corpo não é JSON válido (financiador=%s)", financiador_id)
         return JsonResponse({"erro": "corpo não é JSON válido"}, status=400)
 
     # SPEC03 §5.2 documenta o envelope como objeto solto; o teste de

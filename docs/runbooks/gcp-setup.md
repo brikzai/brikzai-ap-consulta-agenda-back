@@ -435,9 +435,19 @@ documentado na SPEC, que diverge do real):
    — não carrega UR real. Corrigido: só exige `dataHoraEvento` nesse caso; `agenda` e demais
    tipos continuam exigindo os três campos.
 
-Cada um confirmado com log de diagnóstico temporário (nunca logou senha, só forma do header
-e corpo bruto do evento) e removido do código depois de confirmado — ver histórico de commits
-`fix: pass --timeout...` em diante.
+Os 3 foram achados com log de diagnóstico temporário (nunca logou senha, só forma do header
+e corpo bruto do evento). O que está e o que não está confirmado:
+
+- **Bug 1 (auth):** confirmado ponta a ponta — depois de corrigir o header no portal, a
+  requisição da CERC passou a autenticar (deixou de dar `401`).
+- **Bugs 2 e 3 (array + `testeCerc` sem `evento`):** o formato real foi observado no corpo
+  bruto logado da requisição que a CERC mandou; os fixes foram validados só com `curl`
+  reproduzindo esse corpo (`202`). **Não** houve confirmação com uma requisição nova vinda
+  do portal da CERC depois do deploy dos fixes — ver pendência abaixo.
+- **Logs de diagnóstico:** o do header de auth foi removido junto com o fix; o do corpo bruto
+  (`[Webhook][diag2]`) ficou no código por mais um ciclo e foi removido em 2026-09-05, sem
+  a confirmação ponta a ponta que motivava mantê-lo. Se a pendência abaixo exigir novo
+  diagnóstico, reintroduzir só o log do corpo bruto (nunca credenciais), e remover de novo.
 
 **Pendência aberta, não resolvida:** depois dos 3 fixes acima, o botão "testar webhook" do
 portal da CERC continuou reportando `400` (o mesmo erro de antes do fix). Confirmado
